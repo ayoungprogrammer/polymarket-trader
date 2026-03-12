@@ -1,0 +1,25 @@
+[project]
+name = "polymarket-trader"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "requests",
+    "cryptography",
+    "python-dotenv",
+    "pandas",
+    "matplotlib",
+    "anthropic",
+    "flask",
+    "nba_api",
+]
+
+[project.scripts]
+backtest-rounding = "weather.backtest_rounding:main"
+weather-eda = "weather.eda:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

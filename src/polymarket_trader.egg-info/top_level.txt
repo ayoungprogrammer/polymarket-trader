@@ -1,0 +1,3 @@
+bot
+nba
+weather

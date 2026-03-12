@@ -4,3 +4,5 @@ python-dotenv
 pandas
 matplotlib
 anthropic
+flask
+nba_api
