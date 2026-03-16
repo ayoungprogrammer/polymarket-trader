@@ -15,7 +15,6 @@ import os
 
 import json
 import logging
-import re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -31,6 +30,7 @@ from weather.prediction import (
 from weather.observations import SynopticIngestion, fetch_solar_noon, fetch_sun_times
 from weather.bracket_model import load_model as load_bracket_model, get_probability
 from weather.backtest_rounding import extract_regression_features
+from weather.market import parse_all_brackets
 
 log = logging.getLogger(__name__)
 
@@ -121,9 +121,9 @@ You have two jobs:
 - Forecast shows remaining hours could exceed observed max
 - Time of day is too early (before 2 PM local for highs, before 10 AM local for lows)
 
-## Selecting target_temp
-When peak_locked=true, set target_temp to the bracket the market will settle on. \
-Use the bracket model probabilities as your primary guide — set bracket to the \
+## Selecting bracket
+When peak_locked=true, set bracket to the [low, high] °F pair the market will settle in. \
+Use the bracket model probabilities as your primary guide — pick the \
 [low, high] pair with the highest probability unless you have strong reason to \
 override (e.g. forecast shows a later peak that the model hasn't seen yet).
 
@@ -140,7 +140,7 @@ The more negative, the stronger the decline.
 def _call_claude_for_peak_decision(user_message: str) -> dict:
     """Call Claude API to decide if peak has been reached and which bracket to bet.
 
-    Returns dict with {peak_locked, target_temp, confidence, reasoning}.
+    Returns dict with {peak_locked, bracket, confidence, reasoning}.
     On any error, returns peak_locked=False — never bet on failure.
     """
     try:
@@ -177,43 +177,6 @@ def _call_claude_for_peak_decision(user_message: str) -> dict:
 
     log.warning(f"Claude response contained no tool_use block — treating as not locked")
     return {"peak_locked": False, "confidence": "low", "reasoning": "No tool_use in response"}
-
-
-# ---------------------------------------------------------------------------
-# Bracket parsing helper
-# ---------------------------------------------------------------------------
-
-def _parse_all_brackets(markets: List[Dict]) -> List[Tuple[str, int, int]]:
-    """Extract (ticker, lo, hi) bounds from all markets.
-
-    Reuses the same regex patterns as find_matching_bracket.
-    Returns list of (ticker, lo_f, hi_f) for each parseable market.
-    """
-    results: List[Tuple[str, int, int]] = []
-    for market in markets:
-        title = market.get("title", "") + " " + market.get("subtitle", "")
-        ticker = market.get("ticker", "")
-
-        range_match = re.search(r"(\d+)°?\s*(?:to|-)\s*(\d+)°?", title, re.IGNORECASE)
-        if range_match:
-            results.append((ticker, int(range_match.group(1)), int(range_match.group(2))))
-            continue
-
-        # Skip open-ended "or above" / "or below" brackets — not useful for model
-        above_match = re.search(r"(\d+)°?\s*or\s*(above|higher|more)", title, re.IGNORECASE)
-        if above_match:
-            continue
-
-        below_match = re.search(r"(\d+)°?\s*or\s*(below|lower|less)", title, re.IGNORECASE)
-        if below_match:
-            continue
-
-        floor_strike = market.get("floor_strike")
-        cap_strike = market.get("cap_strike")
-        if floor_strike is not None and cap_strike is not None:
-            results.append((ticker, int(float(floor_strike)), int(float(cap_strike))))
-
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -328,13 +291,8 @@ def run_strategy(
                                 resp = client.get_markets(series_ticker)
                                 today_markets = [m for m in resp.get("markets", [])
                                                  if today_suffix in m.get("ticker", "")]
-                                all_brackets = _parse_all_brackets(today_markets)
-                                # Filter to brackets within 3°F of naive temp
-                                naive_f = round(float(feats.get("max_c", 0)) * 9.0 / 5.0 + 32.0)
-                                brackets_parsed = [
-                                    (tk, lo, hi) for tk, lo, hi in all_brackets
-                                    if abs((lo + hi) / 2.0 - naive_f) <= 3
-                                ]
+                                all_brackets = parse_all_brackets(today_markets)
+                                brackets_parsed = list(all_brackets)
                             if not brackets_parsed:
                                 # Synthesize Kalshi-style 2°F brackets from naive rounding
                                 max_c = feats.get("max_c")
@@ -521,18 +479,18 @@ def run_strategy(
     # Use Claude's bracket selection, fall back to bracket model top, then observed max
     bracket = decision.get("bracket")
     if bracket and len(bracket) == 2:
-        target_temp = (bracket[0] + bracket[1]) / 2.0 if bracket[0] != bracket[1] else float(bracket[0])
-        log.info(f"BET: [{bracket[0]}, {bracket[1]}]°F → target {target_temp}°F (Claude selection) | confidence: {confidence}")
-    elif bracket_target_temp is not None:
-        target_temp = bracket_target_temp
-        bracket = [int(target_temp), int(target_temp)]
-        log.info(f"BET: [{bracket[0]}, {bracket[1]}]°F → target {target_temp}°F (bracket model fallback) | confidence: {confidence}")
+        source = "Claude selection"
+    elif top_bracket:
+        bracket = top_bracket
+        source = "bracket model"
     else:
-        target_temp = round(observed_max)
-        bracket = [int(target_temp), int(target_temp)]
-        log.info(f"BET: [{bracket[0]}, {bracket[1]}]°F → target {target_temp}°F (observed max fallback) | confidence: {confidence}")
+        t = int(round(observed_max))
+        bracket = [t, t]
+        source = "observed max fallback"
 
-    return {"action": "bet", "bracket": bracket, "target_temp": target_temp,
+    log.info(f"BET: [{bracket[0]}, {bracket[1]}]°F ({source}) | confidence: {confidence}")
+
+    return {"action": "bet", "bracket": bracket,
             "confidence": confidence, "reasoning": reasoning}
 
 
@@ -542,7 +500,8 @@ def run_strategy(
 
 def main():
     import argparse
-    from bot.app import STATIONS, KalshiClient
+    from weather.sites import KALSHI_STATIONS as STATIONS
+    from bot.app import KalshiClient
     from dotenv import load_dotenv
     from paths import project_path
 

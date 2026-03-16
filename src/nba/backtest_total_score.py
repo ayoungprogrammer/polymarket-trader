@@ -9,7 +9,7 @@ For each historical game, simulates being at a checkpoint:
 Usage:
     PYTHONPATH=src python -m nba.backtest_total_score
     PYTHONPATH=src python -m nba.backtest_total_score --improved --alpha 0.0 --high-conf
-    PYTHONPATH=src python -m nba.backtest_total_score --q4 --alpha 0.0 --high-conf
+    python src/nba/backtest_total_score.py --q4
 """
 
 from __future__ import annotations
@@ -92,6 +92,83 @@ def build_rolling_profiles(
         history[key].append({q: row[q] for q in quarters})
 
     return profiles
+
+
+# ---------------------------------------------------------------------------
+# Cross-team quarter correlations (structural property of games)
+# ---------------------------------------------------------------------------
+
+def compute_quarter_correlations(df: pd.DataFrame) -> dict:
+    """Compute cross-team within-game quarter scoring correlations.
+
+    These are structural properties of basketball (shared pace, competitiveness)
+    and are stable over time, so we compute from the full dataset.
+
+    Returns dict with keys: q1_rho, q2_rho, q3_rho, q4_rho, h2_rho.
+    """
+    home = df[df["home_away"] == "home"].set_index("game_id")
+    away = df[df["home_away"] == "away"].set_index("game_id")
+    common = home.index.intersection(away.index)
+    home = home.loc[common]
+    away = away.loc[common]
+
+    result = {}
+    for q in ["q1", "q2", "q3", "q4"]:
+        r = home[q].corr(away[q])
+        result[f"{q}_rho"] = r if not np.isnan(r) else 0.0
+
+    # H2 = Q3 + Q4 correlation (captures cross-quarter cross-team covariance)
+    h2_home = home["q3"] + home["q4"]
+    h2_away = away["q3"] + away["q4"]
+    r = h2_home.corr(h2_away)
+    result["h2_rho"] = r if not np.isnan(r) else 0.0
+
+    return result
+
+
+def _principled_variance(
+    h_prof: dict,
+    a_prof: dict,
+    remaining_q_indices: List[int],
+    cross_team_rho: float,
+) -> float:
+    """Compute principled prediction variance from three components.
+
+    1. Scoring variance: per-team per-quarter stds (existing)
+    2. Estimation uncertainty: rolling mean has std²/N error
+    3. Cross-team correlation: opponents' scoring is correlated
+
+    Args:
+        h_prof: home team profile with q1_std..q4_std, games_used
+        a_prof: away team profile with q1_std..q4_std, games_used
+        remaining_q_indices: 0-indexed quarter indices (e.g. [2,3] for H2)
+        cross_team_rho: correlation between home/away remaining scoring
+
+    Returns:
+        Total prediction variance (take sqrt for std).
+    """
+    q_std_keys = ["q1_std", "q2_std", "q3_std", "q4_std"]
+    n_home = max(h_prof.get("games_used", 20), 1)
+    n_away = max(a_prof.get("games_used", 20), 1)
+
+    # 1. Scoring variance
+    home_var = sum(h_prof[q_std_keys[q]] ** 2 for q in remaining_q_indices)
+    away_var = sum(a_prof[q_std_keys[q]] ** 2 for q in remaining_q_indices)
+    scoring_var = home_var + away_var
+
+    # 2. Estimation uncertainty (variance of rolling mean estimate)
+    estimation_var = sum(
+        h_prof[q_std_keys[q]] ** 2 / n_home +
+        a_prof[q_std_keys[q]] ** 2 / n_away
+        for q in remaining_q_indices
+    )
+
+    # 3. Cross-team correlation
+    home_std = math.sqrt(home_var) if home_var > 0 else 0.0
+    away_std = math.sqrt(away_var) if away_var > 0 else 0.0
+    correlation_var = 2 * cross_team_rho * home_std * away_std
+
+    return scoring_var + estimation_var + correlation_var
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +391,7 @@ def run_backtest_improved(
     last_n: int = 20,
     min_games: int = 10,
     pace_alpha: float = 0.25,
-    sigma_inflation: float = 1.45,
+    sigma_inflation: float = 1.0,
     opp_adjust: bool = False,
     b2b_adjust: bool = False,
     b2b_penalty: float = 1.5,
@@ -322,14 +399,15 @@ def run_backtest_improved(
     blowout_threshold: float = 15.0,
     blowout_rate: float = 0.1,
 ) -> pd.DataFrame:
-    """Run halftime backtest with pace dampening and calibrated sigma.
+    """Run halftime backtest with pace dampening and principled error estimate.
 
-    Two fixes over the raw model:
-      1. Pace dampening: dampened_pace = 1.0 + alpha * (raw_pace - 1.0)
-         At alpha=0.25, a slow game (pace=0.85) becomes 0.9625, reducing
-         H2 over-adjustment from -16.5 pts to -4.1 pts.
-      2. Sigma inflation: calibrated_std = raw_std * sigma_inflation
-         Raw 1σ covers only ~50%, so inflate by 1.45x to reach ~68%.
+    Pace dampening: dampened_pace = 1.0 + alpha * (raw_pace - 1.0)
+
+    Error estimate uses three components (no backtest tuning):
+      1. Scoring variance: per-team per-quarter stds
+      2. Estimation uncertainty: rolling mean has std²/N error
+      3. Cross-team H2 correlation: opponents share pace within a game
+    sigma_inflation is applied on top (default 1.0 = no inflation).
 
     Optional adjustments:
       - opp_adjust: scale expected H2 by opponent defensive strength
@@ -342,9 +420,11 @@ def run_backtest_improved(
     df = pd.read_csv(CSV_PATH)
     df = df[(df["q1"] > 0) & (df["q2"] > 0) & (df["q3"] > 0) & (df["q4"] > 0)]
 
+    q_corr = compute_quarter_correlations(df)
+
     print(f"Building rolling profiles (last_n={last_n}, min_games={min_games})...")
     profiles = build_rolling_profiles(df, last_n=last_n, min_games=min_games)
-    print(f"  Built {len(profiles)} team-game profiles")
+    print(f"  Built {len(profiles)} team-game profiles (h2_rho={q_corr['h2_rho']:.3f})")
 
     def_profiles: Optional[Dict] = None
     league_avgs: Optional[Dict] = None
@@ -437,10 +517,8 @@ def run_backtest_improved(
             blowout_reduction = (margin_at_half - blowout_threshold) * blowout_rate * remaining_qs
             projected_total -= blowout_reduction
 
-        remaining_var = (
-            h_prof["q3_std"] ** 2 + h_prof["q4_std"] ** 2 +
-            a_prof["q3_std"] ** 2 + a_prof["q4_std"] ** 2
-        )
+        remaining_var = _principled_variance(
+            h_prof, a_prof, [2, 3], q_corr["h2_rho"])
         raw_std = math.sqrt(remaining_var) * dampened_pace
         calibrated_std = raw_std * sigma_inflation
 
@@ -486,7 +564,7 @@ def run_backtest_q4(
     last_n: int = 20,
     min_games: int = 10,
     pace_alpha: float = 0.25,
-    sigma_inflation: float = 1.45,
+    sigma_inflation: float = 1.0,
     opp_adjust: bool = False,
     b2b_adjust: bool = False,
     b2b_penalty: float = 1.5,
@@ -496,8 +574,8 @@ def run_backtest_q4(
 ) -> pd.DataFrame:
     """Backtest projection accuracy at start of Q4 (3 quarters completed).
 
-    Same pace dampening + sigma inflation as the improved halftime model,
-    but with only Q4 remaining → lower uncertainty, better accuracy.
+    Uses principled error estimate (scoring var + estimation uncertainty +
+    cross-team Q4 correlation). sigma_inflation applied on top (default 1.0).
 
     Optional adjustments:
       - opp_adjust: scale expected Q4 by opponent defensive strength
@@ -509,9 +587,11 @@ def run_backtest_q4(
     df = pd.read_csv(CSV_PATH)
     df = df[(df["q1"] > 0) & (df["q2"] > 0) & (df["q3"] > 0) & (df["q4"] > 0)]
 
+    q_corr = compute_quarter_correlations(df)
+
     print(f"Building rolling profiles (last_n={last_n}, min_games={min_games})...")
     profiles = build_rolling_profiles(df, last_n=last_n, min_games=min_games)
-    print(f"  Built {len(profiles)} team-game profiles")
+    print(f"  Built {len(profiles)} team-game profiles (q4_rho={q_corr['q4_rho']:.3f})")
 
     def_profiles: Optional[Dict] = None
     league_avgs: Optional[Dict] = None
@@ -603,8 +683,9 @@ def run_backtest_q4(
             blowout_reduction = (margin_at_q3 - blowout_threshold) * blowout_rate * remaining_qs
             projected_total -= blowout_reduction
 
-        # Variance from Q4 only
-        remaining_var = h_prof["q4_std"] ** 2 + a_prof["q4_std"] ** 2
+        # Variance from Q4 only (principled: scoring + estimation + correlation)
+        remaining_var = _principled_variance(
+            h_prof, a_prof, [3], q_corr["q4_rho"])
         raw_std = math.sqrt(remaining_var) * dampened_pace
         calibrated_std = raw_std * sigma_inflation
 
@@ -757,7 +838,7 @@ def grid_search_alpha(last_n: int = 20, min_games: int = 10) -> None:
         with contextlib.redirect_stdout(buf):
             results = run_backtest_improved(
                 last_n=last_n, min_games=min_games,
-                pace_alpha=alpha, sigma_inflation=1.45,
+                pace_alpha=alpha, sigma_inflation=1.0,
             )
 
         if results.empty:
@@ -1113,7 +1194,7 @@ def grid_search_q4(
     last_n: int = 20,
     min_games: int = 10,
     pace_alpha: float = 0.25,
-    sigma_inflation: float = 1.45,
+    sigma_inflation: float = 1.0,
 ) -> None:
     """Grid search over Q4 P&L parameters: edge_threshold and max_pace_deviation.
 
@@ -1665,7 +1746,7 @@ def run_comparison(
     last_n: int = 20,
     min_games: int = 10,
     pace_alpha: float = 0.25,
-    sigma_inflation: float = 1.45,
+    sigma_inflation: float = 1.0,
     b2b_penalty: float = 1.5,
     blowout_threshold: float = 15.0,
     blowout_rate: float = 0.1,
@@ -1768,7 +1849,7 @@ def run_backtest_perteam(
     last_n: int = 20,
     min_games: int = 10,
     pace_alpha: float = 0.0,
-    sigma_inflation: float = 1.45,
+    sigma_inflation: float = 1.0,
 ) -> pd.DataFrame:
     """Halftime backtest projecting each team's total independently.
 
@@ -1776,7 +1857,7 @@ def run_backtest_perteam(
       1. Computes per-team pace: home_pace = home_h1 / expected_home_h1
       2. Projects each team's H2 using its own pace + profile
       3. Sums for game total
-      4. Variance = sum of both teams' independent H2 variances
+      4. Principled variance: scoring + estimation uncertainty + cross-team rho
 
     This captures asymmetric pace (one team hot, other cold) that combined
     pace averages away.
@@ -1784,9 +1865,11 @@ def run_backtest_perteam(
     df = pd.read_csv(CSV_PATH)
     df = df[(df["q1"] > 0) & (df["q2"] > 0) & (df["q3"] > 0) & (df["q4"] > 0)]
 
+    q_corr = compute_quarter_correlations(df)
+
     print(f"Building rolling profiles (last_n={last_n}, min_games={min_games})...")
     profiles = build_rolling_profiles(df, last_n=last_n, min_games=min_games)
-    print(f"  Built {len(profiles)} team-game profiles")
+    print(f"  Built {len(profiles)} team-game profiles (h2_rho={q_corr['h2_rho']:.3f})")
 
     home = df[df["home_away"] == "home"].set_index("game_id")
     away = df[df["home_away"] == "away"].set_index("game_id")
@@ -1830,10 +1913,10 @@ def run_backtest_perteam(
         proj_away = h1_away + exp_h2_away * away_pace
         projected_total = proj_home + proj_away
 
-        # Per-team H2 variance (independent)
-        home_var = (h_prof["q3_std"] ** 2 + h_prof["q4_std"] ** 2) * home_pace ** 2
-        away_var = (a_prof["q3_std"] ** 2 + a_prof["q4_std"] ** 2) * away_pace ** 2
-        raw_std = math.sqrt(home_var + away_var)
+        # Principled H2 variance (scoring + estimation + correlation)
+        remaining_var = _principled_variance(
+            h_prof, a_prof, [2, 3], q_corr["h2_rho"])
+        raw_std = math.sqrt(remaining_var)
         calibrated_std = raw_std * sigma_inflation
 
         # Combined pace for logging/filtering compatibility
@@ -1875,15 +1958,17 @@ def run_backtest_perteam_q4(
     last_n: int = 20,
     min_games: int = 10,
     pace_alpha: float = 0.0,
-    sigma_inflation: float = 1.45,
+    sigma_inflation: float = 1.0,
 ) -> pd.DataFrame:
     """Q4-start backtest projecting each team's Q4 independently."""
     df = pd.read_csv(CSV_PATH)
     df = df[(df["q1"] > 0) & (df["q2"] > 0) & (df["q3"] > 0) & (df["q4"] > 0)]
 
+    q_corr = compute_quarter_correlations(df)
+
     print(f"Building rolling profiles (last_n={last_n}, min_games={min_games})...")
     profiles = build_rolling_profiles(df, last_n=last_n, min_games=min_games)
-    print(f"  Built {len(profiles)} team-game profiles")
+    print(f"  Built {len(profiles)} team-game profiles (q4_rho={q_corr['q4_rho']:.3f})")
 
     home = df[df["home_away"] == "home"].set_index("game_id")
     away = df[df["home_away"] == "away"].set_index("game_id")
@@ -1927,10 +2012,10 @@ def run_backtest_perteam_q4(
         proj_away = q3_away + a_prof["q4_avg"] * away_pace
         projected_total = proj_home + proj_away
 
-        # Per-team Q4 variance
-        home_var = (h_prof["q4_std"] ** 2) * home_pace ** 2
-        away_var = (a_prof["q4_std"] ** 2) * away_pace ** 2
-        raw_std = math.sqrt(home_var + away_var)
+        # Principled Q4 variance (scoring + estimation + correlation)
+        remaining_var = _principled_variance(
+            h_prof, a_prof, [3], q_corr["q4_rho"])
+        raw_std = math.sqrt(remaining_var)
         calibrated_std = raw_std * sigma_inflation
 
         # Combined pace for logging
@@ -1983,8 +2068,8 @@ if __name__ == "__main__":
                         help="Run improved model with pace dampening + sigma inflation")
     parser.add_argument("--alpha", type=float, default=0.25,
                         help="Pace dampening alpha (default: 0.25)")
-    parser.add_argument("--sigma", type=float, default=1.45,
-                        help="Sigma inflation factor (default: 1.45)")
+    parser.add_argument("--sigma", type=float, default=1.0,
+                        help="Sigma inflation factor (default: 1.0, principled estimate)")
     parser.add_argument("--pnl", action="store_true",
                         help="Run P&L simulation (requires --improved)")
     parser.add_argument("--edge", type=float, default=None,

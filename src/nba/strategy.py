@@ -38,10 +38,15 @@ BLOWOUT_MINUTES_REDUCTION = 0.80  # 80% of expected minutes
 
 # Halftime total projection constants (from backtest validation)
 PACE_DAMPEN_ALPHA = 0.0
-SIGMA_INFLATION = 1.45
+SIGMA_INFLATION = 1.0  # principled variance replaces old 1.45 inflation
 HALFTIME_EDGE_THRESHOLD = 0.10
 MAX_PACE_DEVIATION = 0.15
 MIN_PROFILE_GAMES = 12
+
+# Cross-team within-game quarter correlations (structural property of basketball,
+# computed from 900+ regulation games — shared pace drives positive correlation)
+CROSS_TEAM_RHO_Q4 = 0.074  # corr(home_Q4, away_Q4)
+CROSS_TEAM_RHO_H2 = 0.145  # corr(home_H2, away_H2)
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +109,23 @@ def project_game_total(live_game: dict, quarter_profiles: dict) -> Optional[dict
 
     projected_total = current_total + remaining_expected * pace_factor
 
-    # Confidence band: combine remaining-quarter std devs
+    # Principled confidence band: scoring + estimation uncertainty + cross-team rho
     q_std_keys = ["q1_std", "q2_std", "q3_std", "q4_std"]
-    remaining_var = sum(
-        home_prof[q_std_keys[q]] ** 2 + away_prof[q_std_keys[q]] ** 2
-        for q in range(completed, 4)
+    remaining_qs = list(range(completed, 4))
+    n_home = max(home_prof.get("games_used", 20), 1)
+    n_away = max(away_prof.get("games_used", 20), 1)
+    home_var = sum(home_prof[q_std_keys[q]] ** 2 for q in remaining_qs)
+    away_var = sum(away_prof[q_std_keys[q]] ** 2 for q in remaining_qs)
+    rho = CROSS_TEAM_RHO_H2 if len(remaining_qs) >= 2 else CROSS_TEAM_RHO_Q4
+    estimation_var = sum(
+        home_prof[q_std_keys[q]] ** 2 / n_home +
+        away_prof[q_std_keys[q]] ** 2 / n_away
+        for q in remaining_qs
     )
+    home_std = math.sqrt(home_var) if home_var > 0 else 0.0
+    away_std = math.sqrt(away_var) if away_var > 0 else 0.0
+    remaining_var = (home_var + away_var + estimation_var +
+                     2 * rho * home_std * away_std)
     remaining_std = math.sqrt(remaining_var) * pace_factor
 
     return {
@@ -209,24 +225,31 @@ def project_halftime_total(
         return None
 
     current_total = live_game["home_score"] + live_game["away_score"]
-    completed = min(period, 4)
 
     # Parse game clock to estimate fraction of current quarter remaining
-    q4_frac_remaining = _parse_quarter_remaining(live_game.get("clock", ""))
+    clock = live_game.get("clock", "")
+    q_frac_remaining = _parse_quarter_remaining(clock)
+
+    # completed = number of quarters fully finished
+    # period is the current quarter (1-4), so completed = period - 1
+    # Exception: if clock is empty/zero, the current quarter just ended
+    if not clock or q_frac_remaining == 0.0:
+        completed = min(period, 4)
+    else:
+        completed = min(period - 1, 4)
 
     q_keys = ["q1_avg", "q2_avg", "q3_avg", "q4_avg"]
 
-    # For pace calculation, use completed quarters only (not partial current)
-    pace_quarters = completed if period > 4 else max(completed - 1, 1)
+    # Pace: use all completed quarters (completed = period - 1 when clock active)
     expected_through_pace = sum(
         home_prof[q_keys[q]] + away_prof[q_keys[q]]
-        for q in range(pace_quarters)
+        for q in range(completed)
     )
-    # For mid-quarter: add the played fraction of current quarter's expected
-    if completed >= 2 and completed <= 4 and q4_frac_remaining < 1.0:
-        cur_q_idx = completed - 1
+    # Mid-quarter: add the played fraction of current quarter to pace denominator
+    if completed < 4 and q_frac_remaining > 0 and q_frac_remaining < 1.0:
+        cur_q_idx = completed  # current quarter (0-indexed)
         cur_q_expected = home_prof[q_keys[cur_q_idx]] + away_prof[q_keys[cur_q_idx]]
-        played_frac = 1.0 - q4_frac_remaining
+        played_frac = 1.0 - q_frac_remaining
         expected_through_pace += cur_q_expected * played_frac
 
     if expected_through_pace <= 0:
@@ -235,28 +258,45 @@ def project_halftime_total(
     raw_pace = current_total / expected_through_pace
     dampened_pace = 1.0 + pace_alpha * (raw_pace - 1.0)
 
-    # Remaining expected: full future quarters + remaining fraction of current quarter
+    # Remaining: range(completed, 4) includes full current quarter.
+    # Subtract the already-played portion (it's in current_total).
     remaining_expected = sum(
         home_prof[q_keys[q]] + away_prof[q_keys[q]]
         for q in range(completed, 4)
     )
-    if completed <= 4 and q4_frac_remaining > 0 and q4_frac_remaining < 1.0:
-        cur_q_idx = completed - 1
+    if completed < 4 and q_frac_remaining > 0 and q_frac_remaining < 1.0:
+        cur_q_idx = completed  # current quarter (0-indexed)
         cur_q_expected = home_prof[q_keys[cur_q_idx]] + away_prof[q_keys[cur_q_idx]]
-        remaining_expected += cur_q_expected * q4_frac_remaining
+        played_frac = 1.0 - q_frac_remaining
+        remaining_expected -= cur_q_expected * played_frac
 
     projected_total = current_total + remaining_expected * dampened_pace
 
     q_std_keys = ["q1_std", "q2_std", "q3_std", "q4_std"]
-    remaining_var = sum(
-        home_prof[q_std_keys[q]] ** 2 + away_prof[q_std_keys[q]] ** 2
-        for q in range(completed, 4)
+    remaining_qs = list(range(completed, 4))
+    n_home = max(home_prof.get("games_used", 20), 1)
+    n_away = max(away_prof.get("games_used", 20), 1)
+
+    # Principled variance: scoring + estimation uncertainty + cross-team rho
+    home_var = sum(home_prof[q_std_keys[q]] ** 2 for q in remaining_qs)
+    away_var = sum(away_prof[q_std_keys[q]] ** 2 for q in remaining_qs)
+    scoring_var = home_var + away_var
+    estimation_var = sum(
+        home_prof[q_std_keys[q]] ** 2 / n_home +
+        away_prof[q_std_keys[q]] ** 2 / n_away
+        for q in remaining_qs
     )
-    # Add partial current-quarter variance
-    if completed <= 4 and q4_frac_remaining > 0 and q4_frac_remaining < 1.0:
-        cur_q_idx = completed - 1
+    rho = CROSS_TEAM_RHO_H2 if len(remaining_qs) >= 2 else CROSS_TEAM_RHO_Q4
+    home_std = math.sqrt(home_var) if home_var > 0 else 0.0
+    away_std = math.sqrt(away_var) if away_var > 0 else 0.0
+    correlation_var = 2 * rho * home_std * away_std
+    remaining_var = scoring_var + estimation_var + correlation_var
+
+    # Subtract played portion of current quarter's variance
+    if completed < 4 and q_frac_remaining > 0 and q_frac_remaining < 1.0:
+        cur_q_idx = completed  # current quarter (0-indexed)
         cur_q_var = home_prof[q_std_keys[cur_q_idx]] ** 2 + away_prof[q_std_keys[cur_q_idx]] ** 2
-        remaining_var += cur_q_var * q4_frac_remaining
+        remaining_var -= cur_q_var * (1.0 - q_frac_remaining)
 
     raw_std = math.sqrt(remaining_var) * dampened_pace if remaining_var > 0 else 0.0
     calibrated_std = raw_std * sigma_inflation
@@ -338,7 +378,13 @@ def project_spread(live_game: dict, quarter_profiles: dict) -> Optional[dict]:
     if not home_prof or not away_prof:
         return None
 
-    completed = min(period, 4)
+    clock = live_game.get("clock", "")
+    q_frac = _parse_quarter_remaining(clock)
+    if not clock or q_frac == 0.0:
+        completed = min(period, 4)
+    else:
+        completed = min(period - 1, 4)
+
     home_score = live_game["home_score"]
     away_score = live_game["away_score"]
     current_margin = home_score - away_score
@@ -366,12 +412,23 @@ def project_spread(live_game: dict, quarter_profiles: dict) -> Optional[dict]:
     reversion_factor = {1: 0.50, 2: 0.30, 3: 0.15, 4: 0.05}.get(completed, 0.05)
     projected_margin = raw_margin * (1 - reversion_factor)
 
-    # Confidence band
+    # Principled confidence band
     q_std_keys = ["q1_std", "q2_std", "q3_std", "q4_std"]
-    remaining_var = sum(
-        home_prof[q_std_keys[q]] ** 2 + away_prof[q_std_keys[q]] ** 2
-        for q in range(completed, 4)
+    remaining_qs = list(range(completed, 4))
+    n_home = max(home_prof.get("games_used", 20), 1)
+    n_away = max(away_prof.get("games_used", 20), 1)
+    home_var = sum(home_prof[q_std_keys[q]] ** 2 for q in remaining_qs)
+    away_var = sum(away_prof[q_std_keys[q]] ** 2 for q in remaining_qs)
+    rho = CROSS_TEAM_RHO_H2 if len(remaining_qs) >= 2 else CROSS_TEAM_RHO_Q4
+    estimation_var = sum(
+        home_prof[q_std_keys[q]] ** 2 / n_home +
+        away_prof[q_std_keys[q]] ** 2 / n_away
+        for q in remaining_qs
     )
+    home_std = math.sqrt(home_var) if home_var > 0 else 0.0
+    away_std = math.sqrt(away_var) if away_var > 0 else 0.0
+    remaining_var = (home_var + away_var + estimation_var +
+                     2 * rho * home_std * away_std)
     confidence_band = round(1.5 * math.sqrt(remaining_var), 1)
 
     return {
@@ -790,16 +847,20 @@ def watch_checkpoints(
     confidence: float = 0.90,
     poll_interval: int = 30,
     stop_event: Optional[threading.Event] = None,
+    kalshi_client=None,
 ) -> None:
     """Poll live games and send Telegram alerts at halftime and Q4 start.
 
     At each checkpoint, runs project_halftime_total() to get projected total
     and calibrated_std, then computes high-confidence OVER/UNDER lines.
+    If kalshi_client is provided, also scans Kalshi brackets for edges >= 10%
+    and logs qualifying bets as dry runs.
 
     Args:
         confidence: confidence level for betting lines (default 0.90)
         poll_interval: seconds between polls (default 30)
         stop_event: optional threading.Event to signal shutdown
+        kalshi_client: optional Kalshi API client for edge scanning
     """
     import time
     from statistics import NormalDist
@@ -937,6 +998,7 @@ def watch_checkpoints(
                     _send_checkpoint_alert(
                         game, profiles_ha, "HALFTIME", z, conf_pct,
                     )
+                    _try_edge_scan(game, profiles_ha, kalshi_client, label, "HALFTIME")
                     notified[gid].add("halftime")
 
             # Detect Q4 start: period 3 ended (clock empty) or already in Q4+
@@ -947,6 +1009,7 @@ def watch_checkpoints(
                     _send_checkpoint_alert(
                         game, profiles_ha, "Q4 START", z, conf_pct,
                     )
+                    _try_edge_scan(game, profiles_ha, kalshi_client, label, "Q4 START")
                     notified[gid].add("q4")
 
         stop_event.wait(poll_interval)
@@ -995,23 +1058,43 @@ def _send_checkpoint_alert(
     hp = profiles_ha.get(f"{home}|home")
     ap = profiles_ha.get(f"{away}|away")
     if hp and ap:
-        completed = min(game.get("period", 0), 4)
+        # Use the checkpoint implied by the label, not the current period
+        # (period may have advanced past the checkpoint by the time we poll)
+        if "HALFTIME" in label:
+            completed = 2
+        elif "Q4" in label:
+            completed = 3
+        else:
+            completed = min(game.get("period", 0), 4)
         q_avg = ["q1_avg", "q2_avg", "q3_avg", "q4_avg"]
         q_std = ["q1_std", "q2_std", "q3_std", "q4_std"]
 
         home_so_far = sum(game.get(f"home_q{q}", 0) for q in range(1, completed + 1))
         away_so_far = sum(game.get(f"away_q{q}", 0) for q in range(1, completed + 1))
 
+        home_expected = sum(hp[q_avg[q]] for q in range(completed))
+        away_expected = sum(ap[q_avg[q]] for q in range(completed))
+
         home_remaining = sum(hp[q_avg[q]] for q in range(completed, 4))
         away_remaining = sum(ap[q_avg[q]] for q in range(completed, 4))
 
-        home_var = sum(hp[q_std[q]] ** 2 for q in range(completed, 4))
-        away_var = sum(ap[q_std[q]] ** 2 for q in range(completed, 4))
-        home_std = home_var ** 0.5 * SIGMA_INFLATION
-        away_std = away_var ** 0.5 * SIGMA_INFLATION
+        remaining_qs = list(range(completed, 4))
+        n_hp = max(hp.get("games_used", 20), 1)
+        n_ap = max(ap.get("games_used", 20), 1)
+        home_var = sum(hp[q_std[q]] ** 2 for q in remaining_qs)
+        away_var = sum(ap[q_std[q]] ** 2 for q in remaining_qs)
+        # Add estimation uncertainty (std²/N)
+        home_var += sum(hp[q_std[q]] ** 2 / n_hp for q in remaining_qs)
+        away_var += sum(ap[q_std[q]] ** 2 / n_ap for q in remaining_qs)
+        home_std = home_var ** 0.5
+        away_std = away_var ** 0.5
 
-        home_proj = round(home_so_far + home_remaining, 1)
-        away_proj = round(away_so_far + away_remaining, 1)
+        # Apply per-team pace (how much faster/slower than expected so far)
+        home_pace = home_so_far / home_expected if home_expected > 0 else 1.0
+        away_pace = away_so_far / away_expected if away_expected > 0 else 1.0
+
+        home_proj = round(home_so_far + home_remaining * home_pace, 1)
+        away_proj = round(away_so_far + away_remaining * away_pace, 1)
 
         home_over = round(home_proj - z * home_std, 1)
         home_under = round(home_proj + z * home_std, 1)
@@ -1036,6 +1119,162 @@ def _send_checkpoint_alert(
                  away, away_proj, away_over, away_under)
 
     _send_telegram(msg)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint edge scanning helper (called from watch_checkpoints)
+# ---------------------------------------------------------------------------
+
+def _try_edge_scan(
+    game: dict,
+    profiles_ha: dict,
+    kalshi_client,
+    label: str,
+    checkpoint: str,
+) -> None:
+    """Scan Kalshi brackets for edges at a checkpoint and log as dry-run bets."""
+    if kalshi_client is None:
+        return
+
+    proj = project_halftime_total(game, profiles_ha)
+    if not proj:
+        return
+
+    from db import init_db, log_bet
+    init_db()
+
+    edges = _scan_checkpoint_edges(game, proj, kalshi_client)
+    if not edges:
+        log.info("[NBA-EDGES] %s %s: no edges >= 10%%", label, checkpoint)
+        return
+
+    for e in edges:
+        log.info(
+            "[NBA-EDGES] %s %s: %s %s %.1f @ %d¢  model=%.1f%%  edge=+%.1f%%",
+            label, checkpoint, e["ticker"], e["side"], e["line"],
+            e["ask_cents"], e["model_prob"], e["edge_pct"],
+        )
+        log_bet(
+            strategy="nba-checkpoint",
+            market=e["ticker"],
+            price_cents=e["ask_cents"],
+            count=1,
+            dry_run=True,
+            metadata={
+                "checkpoint": checkpoint,
+                "game": e["game"],
+                "side": e["side"],
+                "line": e["line"],
+                "model_prob": e["model_prob"],
+                "edge_pct": e["edge_pct"],
+                "projected_total": proj["projected_total"],
+                "calibrated_std": proj["calibrated_std"],
+            },
+        )
+
+    # Send top 5 edges via Telegram
+    from bot.app import _send_telegram
+    top = edges[:5]
+    lines = [f"<b>{checkpoint} Edges ({game['away_team']}@{game['home_team']}):</b>"]
+    for e in top:
+        lines.append(
+            f"  {e['side'].upper()} {e['line']} @ {e['ask_cents']}¢ — "
+            f"model {e['model_prob']}% — edge +{e['edge_pct']}%"
+        )
+    _send_telegram("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint edge scanner — scan Kalshi brackets at halftime / Q4
+# ---------------------------------------------------------------------------
+
+def _scan_checkpoint_edges(
+    game: dict,
+    proj: dict,
+    kalshi_client,
+    min_edge: float = 0.10,
+) -> List[dict]:
+    """Scan Kalshi NBA total markets for edges on a single game.
+
+    Uses the projection already computed at the checkpoint.
+    Returns list of edges where |edge| >= min_edge.
+    """
+    from nba.markets import discover_nba_series, get_game_markets, parse_market_line
+
+    home = game["home_team"]
+    away = game["away_team"]
+    projected = proj["projected_total"]
+    std = proj.get("calibrated_std", proj.get("remaining_std", 10.0))
+
+    try:
+        series = discover_nba_series(kalshi_client)
+    except Exception as e:
+        log.error("[NBA-EDGES] Failed to discover series: %s", e)
+        return []
+
+    all_markets = []
+    for ticker in series:
+        try:
+            markets = get_game_markets(kalshi_client, ticker, status="open")
+            all_markets.extend(markets)
+        except Exception:
+            pass
+
+    if not all_markets:
+        return []
+
+    edges = []
+    for mkt in all_markets:
+        parsed = parse_market_line(mkt)
+        if not parsed:
+            continue
+
+        # Only game totals (over/under), matching this game
+        if parsed.get("side") not in ("over", "under") or parsed.get("player"):
+            continue
+        title = mkt.get("title", "") + " " + mkt.get("subtitle", "")
+        if home not in title and away not in title:
+            continue
+
+        line = parsed["line"]
+        prob_over = _total_to_probability(projected, line, std)
+
+        # Get ask price
+        try:
+            book = kalshi_client.get_orderbook(mkt["ticker"])
+            no_bids = book.get("no", [])
+            yes_bids = book.get("yes", [])
+            if no_bids:
+                yes_ask_cents = 100 - no_bids[-1][0]
+            elif yes_bids:
+                yes_ask_cents = yes_bids[-1][0]
+            else:
+                continue
+            yes_ask = yes_ask_cents / 100.0
+        except Exception:
+            continue
+
+        if parsed["side"] == "over":
+            model_prob = prob_over
+        else:
+            model_prob = 1.0 - prob_over
+
+        edge = model_prob - yes_ask
+
+        if edge >= min_edge:
+            edges.append({
+                "ticker": mkt["ticker"],
+                "side": parsed["side"],
+                "line": line,
+                "buy_side": "yes",
+                "ask_cents": yes_ask_cents,
+                "model_prob": round(model_prob * 100, 1),
+                "edge_pct": round(edge * 100, 1),
+                "game": f"{away}@{home}",
+            })
+
+    edges.sort(key=lambda e: e["edge_pct"], reverse=True)
+    return edges
 
 
 # ---------------------------------------------------------------------------

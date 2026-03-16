@@ -14,31 +14,7 @@ import requests
 
 log = logging.getLogger(__name__)
 
-# (lat, lon, timezone)
-STATIONS = {
-    "KLAX": (33.9381, -118.3889, "America/Los_Angeles"),
-    "KSFO": (37.6188, -122.3647, "America/Los_Angeles"),
-    "KJFK": (40.6398, -73.7787, "America/New_York"),
-    "KPHL": (39.8721, -75.2411, "America/New_York"),
-    "KSEA": (47.4502, -122.3088, "America/Los_Angeles"),
-    "KSHN": (47.2336, -123.1464, "America/Los_Angeles"),
-    "KMIA": (25.7954, -80.2901, "America/New_York"),
-    "KMDW": (41.7868, -87.7455, "America/Chicago"), 
-    "KDEN": (39.8482, -104.6738, "America/Denver"),
-    "KPHX": (33.4355, -111.9981, "America/Phoenix"),
-    "KOKC": (35.3931, -97.6009, "America/Chicago"),
-    "KATL": (33.6367, -84.4279, "America/New_York"),
-    "KDFW": (32.8972, -97.0377, "America/Chicago"),
-    "KSAT": (29.5338, -98.47, "America/Chicago"),
-    "KHOU": (29.6458, -95.2772, "America/Chicago"),
-    "KMSP": (44.882, -93.2218, "America/Chicago"),
-    "KDAL": (32.8471, -96.8519, "America/Chicago"),
-    "KDCA": (38.8894, -77.0351, "America/New_York"),
-    "KAUS": (30.1945, -97.6699, "America/Chicago"),
-    "KBOS": (42.3656, -71.0096, "America/New_York"),
-    "KDAL": (32.778, -96.7962, "America/Chicago"),
-    
-}
+from weather.sites import FORECAST_STATIONS as STATIONS
 
 def get_peak_profile(forecast_df: pd.DataFrame) -> Optional[str]:
     """Characterize the forecasted peak shape from hourly forecast data.

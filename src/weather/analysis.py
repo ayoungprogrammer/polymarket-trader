@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Historical peak consistency analysis for temperature betting sites.
 
-Fetches ~100 days of 5-min weather observations from the Synoptic API,
+Fetches ~180 days of 5-min weather observations from the Synoptic API,
 extracts daily highs, and computes per-site "peak consistency" metrics
 that indicate how predictable each station's daily peak timing and
 post-peak decline are.
@@ -21,17 +21,17 @@ import numpy as np
 import pandas as pd
 
 from paths import project_path
-from weather.forecast import STATIONS as FORECAST_STATIONS
+from weather.sites import FORECAST_STATIONS, TRAINING_STATIONS, ALL_SITES, ALL_SITES_WITH_TRAINING
 from weather.observations import SYNOPTIC_API_BASE, SYNOPTIC_TOKEN, _synoptic_obs_to_df
 
 log = logging.getLogger(__name__)
 
 DATA_DIR = project_path("data")
+
+# Combined station coords: Kalshi sites + training-only sites
+_ALL_STATION_COORDS = {**TRAINING_STATIONS, **FORECAST_STATIONS}
 CHARTS_DIR = project_path("charts")
 SOLAR_NOON_CSV = os.path.join(DATA_DIR, "solar_noon.csv")
-
-# All sites to analyse (intersection of forecast.py STATIONS)
-ALL_SITES = sorted(FORECAST_STATIONS.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +49,9 @@ def fetch_solar_noon(
     """
     import requests
 
-    coords = FORECAST_STATIONS.get(site)
+    coords = _ALL_STATION_COORDS.get(site)
     if not coords:
-        log.warning(f"[{site}] No coordinates in FORECAST_STATIONS")
+        log.warning(f"[{site}] No coordinates for site")
         return pd.DataFrame()
 
     lat, lon, tz = coords
@@ -251,7 +251,7 @@ def fetch_historical_obs(
 
 def load_or_fetch(
     site: str,
-    days: int = 100,
+    days: int = 180,
     force: bool = False,
 ) -> pd.DataFrame:
     """Load cached history CSV, fetching missing date ranges as needed."""
@@ -259,7 +259,7 @@ def load_or_fetch(
     csv_path = os.path.join(DATA_DIR, f"history_{site}.csv")
 
     from zoneinfo import ZoneInfo
-    tz_name = FORECAST_STATIONS.get(site, (0, 0, "America/New_York"))[2]
+    tz_name = _ALL_STATION_COORDS.get(site, (0, 0, "America/New_York"))[2]
     tz = ZoneInfo(tz_name)
     now_local = datetime.now(tz)
     target_start = (now_local - timedelta(days=days)).replace(
@@ -517,7 +517,7 @@ def compute_peak_metrics(daily_df: pd.DataFrame, obs_df: pd.DataFrame, site: str
     daily_high_mean = float(site_daily["daily_high_f"].mean())
     daily_high_std = float(site_daily["daily_high_f"].std()) if len(site_daily) > 1 else 0
 
-    tz_name = FORECAST_STATIONS.get(site, (0, 0, "America/New_York"))[2]
+    tz_name = _ALL_STATION_COORDS.get(site, (0, 0, "America/New_York"))[2]
 
     return {
         "site": site,
@@ -807,7 +807,7 @@ def compute_forecast_accuracy(
     """
     import requests
 
-    coords = FORECAST_STATIONS.get(site)
+    coords = _ALL_STATION_COORDS.get(site)
     if not coords:
         return None
 
@@ -868,6 +868,7 @@ def compute_forecast_accuracy(
 
 
 FORECAST_HIGHS_CSV = os.path.join(DATA_DIR, "forecast_highs.csv")
+FORECAST_HOURLY_CSV = os.path.join(DATA_DIR, "forecast_hourly.csv")
 
 
 def fetch_historical_forecasts(
@@ -886,7 +887,7 @@ def fetch_historical_forecasts(
     import time as _time
 
     if sites is None:
-        sites = ALL_SITES
+        sites = ALL_SITES_WITH_TRAINING
 
     # Load existing data to avoid re-fetching
     existing = pd.DataFrame()
@@ -901,7 +902,7 @@ def fetch_historical_forecasts(
     new_rows: list = []
 
     for site in sites:
-        coords = FORECAST_STATIONS.get(site)
+        coords = _ALL_STATION_COORDS.get(site)
         if not coords:
             print(f"  {site}: no coordinates, skipping")
             continue
@@ -973,13 +974,124 @@ def fetch_historical_forecasts(
     return combined
 
 
+def fetch_historical_hourly_forecasts(
+    sites: Optional[list] = None,
+) -> pd.DataFrame:
+    """Fetch hourly Open-Meteo historical forecasts for all sites.
+
+    Saves to data/forecast_hourly.csv with columns:
+        site, date, hour, temperature_f
+
+    Each row is one forecast hour (0-23) for one site-day.
+    Merges with existing CSV to avoid re-fetching.
+    """
+    import requests
+    import time as _time
+
+    if sites is None:
+        sites = ALL_SITES_WITH_TRAINING
+
+    existing = pd.DataFrame()
+    if os.path.isfile(FORECAST_HOURLY_CSV):
+        existing = pd.read_csv(FORECAST_HOURLY_CSV)
+        print(f"  Loaded {len(existing)} existing hourly forecast rows")
+
+    existing_keys = set()
+    if not existing.empty:
+        existing_keys = set(zip(existing["site"], existing["date"]))
+
+    new_rows: list = []
+
+    for site in sites:
+        coords = _ALL_STATION_COORDS.get(site)
+        if not coords:
+            print(f"  {site}: no coordinates, skipping")
+            continue
+
+        lat, lon, tz = coords
+
+        csv_path = os.path.join(DATA_DIR, f"history_{site}.csv")
+        if not os.path.isfile(csv_path):
+            print(f"  {site}: no history CSV, skipping")
+            continue
+
+        hist = pd.read_csv(csv_path)
+        ts = pd.to_datetime(hist["timestamp"].str[:19])
+        dates = sorted(ts.dt.date.astype(str).unique())
+        if not dates:
+            continue
+
+        needed = [d for d in dates if (site, d) not in existing_keys]
+        if not needed:
+            print(f"  {site}: all {len(dates)} dates already cached")
+            continue
+
+        # Batch into 30-day chunks to avoid huge API responses
+        chunk_size = 30
+        count = 0
+        for i in range(0, len(needed), chunk_size):
+            chunk = needed[i:i + chunk_size]
+            start_date = chunk[0]
+            end_date = chunk[-1]
+
+            try:
+                resp = requests.get(OPEN_METEO_URL, params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "hourly": "temperature_2m",
+                    "temperature_unit": "fahrenheit",
+                    "timezone": tz,
+                }, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                print(f"  {site}: Open-Meteo hourly request failed: {e}")
+                continue
+
+            api_times = data["hourly"]["time"]
+            api_temps = data["hourly"]["temperature_2m"]
+
+            for t, v in zip(api_times, api_temps):
+                if v is None:
+                    continue
+                d = t[:10]
+                h = int(t[11:13])
+                if (site, d) not in existing_keys:
+                    new_rows.append({
+                        "site": site,
+                        "date": d,
+                        "hour": h,
+                        "temperature_f": round(v, 1),
+                    })
+                    count += 1
+
+            _time.sleep(0.3)
+
+        print(f"  {site}: got {count} new hourly entries")
+
+    if new_rows:
+        new_df = pd.DataFrame(new_rows)
+        combined = pd.concat([existing, new_df], ignore_index=True)
+    else:
+        combined = existing
+
+    if not combined.empty:
+        combined = combined.sort_values(["site", "date", "hour"]).reset_index(drop=True)
+        combined.to_csv(FORECAST_HOURLY_CSV, index=False)
+        print(f"\n  Saved {len(combined)} hourly entries to {FORECAST_HOURLY_CSV}")
+
+    return combined
+
+
 # ---------------------------------------------------------------------------
 # Main analysis pipeline
 # ---------------------------------------------------------------------------
 
 def run_analysis(
     sites: Optional[list] = None,
-    days: int = 100,
+    days: int = 180,
     fetch_only: bool = False,
     no_fetch: bool = False,
 ) -> list:
@@ -988,7 +1100,7 @@ def run_analysis(
     Returns a list of per-site result dicts.
     """
     if sites is None:
-        sites = ALL_SITES
+        sites = ALL_SITES_WITH_TRAINING
 
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(CHARTS_DIR, exist_ok=True)
@@ -1152,8 +1264,8 @@ def main():
         help="Comma-separated ICAO codes (default: all sites)",
     )
     parser.add_argument(
-        "--days", type=int, default=100,
-        help="Days of history to analyse (default: 100)",
+        "--days", type=int, default=180,
+        help="Days of history to analyse (default: 180)",
     )
     parser.add_argument(
         "--fetch-only", action="store_true",
@@ -1167,6 +1279,10 @@ def main():
         "--fetch-forecasts", action="store_true",
         help="Fetch per-day historical forecast highs from Open-Meteo and save to CSV",
     )
+    parser.add_argument(
+        "--fetch-hourly-forecasts", action="store_true",
+        help="Fetch hourly historical forecasts from Open-Meteo and save to CSV",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -1179,10 +1295,12 @@ def main():
         sites = [s.strip().upper() for s in args.sites.split(",")]
         # Validate
         for s in sites:
-            if s not in FORECAST_STATIONS:
-                parser.error(f"Unknown site {s}. Available: {', '.join(ALL_SITES)}")
+            if s not in _ALL_STATION_COORDS:
+                parser.error(f"Unknown site {s}. Available: {', '.join(ALL_SITES_WITH_TRAINING)}")
 
-    if args.fetch_forecasts:
+    if args.fetch_hourly_forecasts:
+        fetch_historical_hourly_forecasts(sites)
+    elif args.fetch_forecasts:
         fetch_historical_forecasts(sites)
     else:
         run_analysis(

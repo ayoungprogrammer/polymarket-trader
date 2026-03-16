@@ -25,10 +25,7 @@ from weather.prediction import compute_momentum, predict_settlement_f
 
 DATA_DIR = project_path("data")
 
-ALL_SITES = [
-    "KLAX", "KMIA", "KSFO", "KMDW", "KDEN", "KPHX",
-    "KOKC", "KATL", "KDFW", "KSAT", "KHOU", "KMSP", "KDCA", "KAUS", "KBOS", "KPHL",
-]
+from weather.sites import ALL_SITES
 
 from weather.prediction import MA_SHORT_MIN, MA_LONG_MIN
 

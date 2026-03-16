@@ -456,9 +456,7 @@ def run_backtest(sites: Optional[List[str]] = None):
 _MET_FEATURE_NAMES = [
     "wind_at_peak", "wind_pre_peak", "wind_calm_frac",
     "wind_gust_range", "wind_change_at_peak",
-    "dewpoint_depression", "rh_at_peak", "rh_min_near_peak",
-    "cloud_at_peak", "clear_sky_frac",
-    "pressure_change_3hr",
+    "rh_at_peak", "rh_min_near_peak",
 ]
 
 
@@ -520,39 +518,12 @@ def _met_features(
     wind_change_at_peak = (wind_at_peak - wind_pre_peak) if not (np.isnan(wind_at_peak) or np.isnan(wind_pre_peak)) else np.nan
 
     # --- Category B: Moisture ---
-    dewpt = pd.to_numeric(day_df.get("dewpoint_f"), errors="coerce").values if "dewpoint_f" in day_df.columns else np.full(n, np.nan)
-    temp_f = pd.to_numeric(day_df.get("temperature_f"), errors="coerce").values if "temperature_f" in day_df.columns else np.full(n, np.nan)
     rh = pd.to_numeric(day_df.get("relative_humidity_pct"), errors="coerce").values if "relative_humidity_pct" in day_df.columns else np.full(n, np.nan)
 
-    dep_vals = temp_f[peak_df_idxs] - dewpt[peak_df_idxs]
-    dewpoint_depression = float(np.nanmean(dep_vals)) if np.any(~np.isnan(dep_vals)) else np.nan
     rh_peak = rh[peak_df_idxs]
     rh_at_peak = float(np.nanmean(rh_peak)) if np.any(~np.isnan(rh_peak)) else np.nan
     rh_near = rh[near_start:near_end]
     rh_min_near_peak = float(np.nanmin(rh_near)) if len(rh_near) > 0 and np.any(~np.isnan(rh_near)) else np.nan
-
-    # --- Category C: Cloud cover ---
-    cloud_map = {"CLR": 0.0, "FEW": 0.25, "SCT": 0.5, "BKN": 0.75, "OVC": 1.0}
-    if "cloud_layer_code" in day_df.columns:
-        cloud_raw = day_df["cloud_layer_code"].values
-        cloud_vals = np.array([cloud_map.get(str(v).split(":")[0].upper().strip(), np.nan)
-                               for v in cloud_raw])
-    else:
-        cloud_vals = np.full(n, np.nan)
-
-    cloud_peak = cloud_vals[peak_df_idxs]
-    cloud_at_peak = float(np.nanmean(cloud_peak)) if np.any(~np.isnan(cloud_peak)) else np.nan
-    cloud_near = cloud_vals[near_start:near_end]
-    clear_sky_frac = float(np.nanmean(cloud_near <= 0.25)) if len(cloud_near) > 0 and np.any(~np.isnan(cloud_near)) else np.nan
-
-    # --- Category G: Pressure ---
-    slp = pd.to_numeric(day_df.get("sea_level_pressure"), errors="coerce").values if "sea_level_pressure" in day_df.columns else np.full(n, np.nan)
-
-    # SLP at peak minus SLP ~36 readings (~3hr) before
-    pre_3h_idx = max(0, first_max - 36)
-    slp_at_peak = slp[first_max] if not np.isnan(slp[first_max]) else np.nan
-    slp_pre = slp[pre_3h_idx] if not np.isnan(slp[pre_3h_idx]) else np.nan
-    pressure_change_3hr = (slp_at_peak - slp_pre) if not (np.isnan(slp_at_peak) or np.isnan(slp_pre)) else np.nan
 
     return {
         "wind_at_peak": wind_at_peak,
@@ -560,12 +531,8 @@ def _met_features(
         "wind_calm_frac": wind_calm_frac,
         "wind_gust_range": wind_gust_range,
         "wind_change_at_peak": wind_change_at_peak,
-        "dewpoint_depression": dewpoint_depression,
         "rh_at_peak": rh_at_peak,
         "rh_min_near_peak": rh_min_near_peak,
-        "cloud_at_peak": cloud_at_peak,
-        "clear_sky_frac": clear_sky_frac,
-        "pressure_change_3hr": pressure_change_3hr,
     }
 
 
@@ -1263,6 +1230,24 @@ def extract_regression_features(
     else:
         max_minus_ma15 = 0.0
 
+    # --- Rounding gap at peak edge -------------------------------------------
+    # Does dropping from max_c to max_c-1 cause a 2°F shift in settlement?
+    # e.g. 27°C→81°F, 26°C→79°F = 2°F gap. This makes the peak fragile:
+    # losing 1°C costs 2°F instead of the usual 1°F.
+    naive_f_at_max = round(max_c * 9.0 / 5.0 + 32.0)
+    naive_f_at_prev = round((max_c - 1) * 9.0 / 5.0 + 32.0)
+    naive_f_at_next = round((max_c + 1) * 9.0 / 5.0 + 32.0)
+    peak_edge_f_gap_below = naive_f_at_max - naive_f_at_prev  # 1 or 2 (cost of losing 1°C)
+    peak_edge_f_gap_above = naive_f_at_next - naive_f_at_max  # 1 or 2 (gain from +1°C)
+
+    # Distance in °C from max_c to the rounding boundary for next/prev °F
+    # Upper boundary: °C where round(C*9/5+32) flips from naive_f to naive_f+1
+    # Lower boundary: °C where round(C*9/5+32) flips from naive_f to naive_f-1
+    c_upper_boundary = (naive_f + 0.5 - 32.0) * 5.0 / 9.0
+    c_lower_boundary = (naive_f - 0.5 - 32.0) * 5.0 / 9.0
+    dist_c_to_next_f = c_upper_boundary - max_c   # °C margin before rounding up
+    dist_c_to_prev_f = max_c - c_lower_boundary   # °C margin before rounding down
+
     # Range of °F in 30min around peak
     temp_f_range_30m = float(np.ptp(vol30_valid)) if len(vol30_valid) >= 2 else 0.0
 
@@ -1370,6 +1355,11 @@ def extract_regression_features(
         "max_minus_ma15": max_minus_ma15,
         "max_minus_ma30": max_minus_ma30,
         "max_minus_ma60": max_minus_ma60,
+        # --- Peak edge rounding ---
+        "peak_edge_f_gap_below": float(peak_edge_f_gap_below),        # °F gap when dropping from max_c to max_c-1 (1 or 2)
+        "peak_edge_f_gap_above": float(peak_edge_f_gap_above),  # °F gap when gaining max_c to max_c+1 (1 or 2)
+        "dist_c_to_next_f": dist_c_to_next_f,                    # °C margin to round up to naive_f+1
+        "dist_c_to_prev_f": dist_c_to_prev_f,                    # °C margin to round down to naive_f-1
         # --- Meta / target ---
         "naive_f": naive_f,
         "possible_f": possible_f,
@@ -1421,6 +1411,11 @@ AUTO_FEATURE_COLS = [
     "temp_f_mean_abs_diff", "temp_f_mean_abs_diff_30m",
     "sub_hour_oscillation_rate",
     "max_minus_ma15", "max_minus_ma30", "max_minus_ma60",
+    # --- Peak edge rounding ---
+    "peak_edge_f_gap_below",
+    "peak_edge_f_gap_above",
+    "dist_c_to_next_f",
+    "dist_c_to_prev_f",
 ]
 
 # METAR-derived features (require T-group precision readings).

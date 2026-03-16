@@ -341,6 +341,145 @@ def deep_analysis(rdf: pd.DataFrame):
     print(f"  metar_confirm >= 0.25: {int((rdf['metar_confirm'] >= 0.25).sum())}")
     print(f"  Both >= 0.25: {int(((rdf['metar_confirm'] >= 0.25) & (rdf['metar_gap_c'] >= 0.25)).sum())}")
 
+    # --- peak_edge_f_gap_below / _above ---
+    print("\n--- peak_edge_f_gap_below (°F lost when dropping 1°C at peak) ---")
+    for val in sorted(rdf["peak_edge_f_gap_below"].dropna().unique()):
+        mask = rdf["peak_edge_f_gap_below"] == val
+        sub = rdf.loc[mask, "offset"]
+        n_sub = len(sub)
+        if n_sub < 5:
+            continue
+        counts = sub.value_counts()
+        pct_m1 = counts.get(-1, 0) / n_sub
+        pct_0 = counts.get(0, 0) / n_sub
+        pct_p1 = counts.get(1, 0) / n_sub
+        print(f"  gap_below={val:.0f}  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    print("\n--- peak_edge_f_gap_above (°F gained from +1°C at peak) ---")
+    for val in sorted(rdf["peak_edge_f_gap_above"].dropna().unique()):
+        mask = rdf["peak_edge_f_gap_above"] == val
+        sub = rdf.loc[mask, "offset"]
+        n_sub = len(sub)
+        if n_sub < 5:
+            continue
+        counts = sub.value_counts()
+        pct_m1 = counts.get(-1, 0) / n_sub
+        pct_0 = counts.get(0, 0) / n_sub
+        pct_p1 = counts.get(1, 0) / n_sub
+        print(f"  gap_above={val:.0f}  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # Combo: gap_below==2 + naive_is_high
+    print("\n--- peak_edge_f_gap_below == 2 + naive_is_high ---")
+    for nih in [0, 1]:
+        mask = (rdf["peak_edge_f_gap_below"] == 2) & (rdf["naive_is_high"] == nih)
+        sub = rdf.loc[mask, "offset"]
+        n_sub = len(sub)
+        if n_sub < 5:
+            continue
+        counts = sub.value_counts()
+        pct_m1 = counts.get(-1, 0) / n_sub
+        pct_0 = counts.get(0, 0) / n_sub
+        pct_p1 = counts.get(1, 0) / n_sub
+        print(f"  gap_below=2, naive_is_high={nih}  n={n_sub:>4d}  "
+              f"-1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # Combo: gap_above==2 + naive_is_high
+    print("\n--- peak_edge_f_gap_above == 2 + naive_is_high ---")
+    for nih in [0, 1]:
+        mask = (rdf["peak_edge_f_gap_above"] == 2) & (rdf["naive_is_high"] == nih)
+        sub = rdf.loc[mask, "offset"]
+        n_sub = len(sub)
+        if n_sub < 5:
+            continue
+        counts = sub.value_counts()
+        pct_m1 = counts.get(-1, 0) / n_sub
+        pct_0 = counts.get(0, 0) / n_sub
+        pct_p1 = counts.get(1, 0) / n_sub
+        print(f"  gap_above=2, naive_is_high={nih}  n={n_sub:>4d}  "
+              f"-1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # --- dist_c_to_next_f (°C margin to round up) ---
+    print("\n--- dist_c_to_next_f (°C margin to round up to naive_f+1) ---")
+    for thr in [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]:
+        mask = rdf["dist_c_to_next_f"] <= thr
+        sub = rdf.loc[mask, "offset"]
+        n_sub = len(sub)
+        if n_sub < 10:
+            continue
+        counts = sub.value_counts()
+        pct_m1 = counts.get(-1, 0) / n_sub
+        pct_0 = counts.get(0, 0) / n_sub
+        pct_p1 = counts.get(1, 0) / n_sub
+        print(f"  dist_next <= {thr:.2f}  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    print("\n--- dist_c_to_next_f + naive_is_high ---")
+    for nih in [0, 1]:
+        for thr in [0.1, 0.15, 0.2, 0.3]:
+            mask = (rdf["dist_c_to_next_f"] <= thr) & (rdf["naive_is_high"] == nih)
+            sub = rdf.loc[mask, "offset"]
+            n_sub = len(sub)
+            if n_sub < 10:
+                continue
+            counts = sub.value_counts()
+            pct_m1 = counts.get(-1, 0) / n_sub
+            pct_0 = counts.get(0, 0) / n_sub
+            pct_p1 = counts.get(1, 0) / n_sub
+            print(f"  dist_next <= {thr:.2f}, nih={nih}  n={n_sub:>4d}  "
+                  f"-1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # --- dist_c_to_prev_f (°C margin to round down) ---
+    print("\n--- dist_c_to_prev_f (°C margin to round down to naive_f-1) ---")
+    for thr in [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]:
+        mask = rdf["dist_c_to_prev_f"] <= thr
+        sub = rdf.loc[mask, "offset"]
+        n_sub = len(sub)
+        if n_sub < 10:
+            continue
+        counts = sub.value_counts()
+        pct_m1 = counts.get(-1, 0) / n_sub
+        pct_0 = counts.get(0, 0) / n_sub
+        pct_p1 = counts.get(1, 0) / n_sub
+        print(f"  dist_prev <= {thr:.2f}  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    print("\n--- dist_c_to_prev_f + naive_is_high ---")
+    for nih in [0, 1]:
+        for thr in [0.1, 0.15, 0.2, 0.3]:
+            mask = (rdf["dist_c_to_prev_f"] <= thr) & (rdf["naive_is_high"] == nih)
+            sub = rdf.loc[mask, "offset"]
+            n_sub = len(sub)
+            if n_sub < 10:
+                continue
+            counts = sub.value_counts()
+            pct_m1 = counts.get(-1, 0) / n_sub
+            pct_0 = counts.get(0, 0) / n_sub
+            pct_p1 = counts.get(1, 0) / n_sub
+            print(f"  dist_prev <= {thr:.2f}, nih={nih}  n={n_sub:>4d}  "
+                  f"-1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # --- dist_c_to_next_f <= 0.35 overlap with structural clamp conditions ---
+    print("\n--- dist_c_to_next_f <= 0.35: overlap with existing -1→0 clamp rules ---")
+    dist_mask = rdf["dist_c_to_next_f"] <= 0.35
+    n_dist = int(dist_mask.sum())
+    print(f"  1. Total rows where dist_c_to_next_f <= 0.35: {n_dist}")
+
+    # Existing structural clamp conditions that already clamp -1→0
+    nih0_mask = rdf["naive_is_high"] == 0  # superset condition
+    already_covered = dist_mask & nih0_mask
+    print(f"  2. Already covered by naive_is_high == 0: {int(already_covered.sum())} / {n_dist}")
+
+    novel_mask = dist_mask & (rdf["naive_is_high"] == 1)
+    n_novel = int(novel_mask.sum())
+    print(f"  3. Novel rows (dist_c_to_next_f <= 0.35 AND naive_is_high == 1): {n_novel}")
+
+    if n_novel > 0:
+        novel_offsets = rdf.loc[novel_mask, "offset"]
+        counts = novel_offsets.value_counts().sort_index()
+        print(f"  4. Offset distribution for novel rows:")
+        for off_val, cnt in counts.items():
+            print(f"       offset={off_val:+d}: {cnt:>4d} ({cnt/n_novel:.1%})")
+    else:
+        print(f"  4. No novel rows — all covered by naive_is_high == 0")
+
     # --- Summary of strict rules ---
     print("\n" + "=" * 90)
     print("SUMMARY: PERFECT OR NEAR-PERFECT RULES")
@@ -349,7 +488,7 @@ def deep_analysis(rdf: pd.DataFrame):
     rules = [
         ("n_possible_f == 1 (exact)", rdf["n_possible_f"] == 1, "clamp to 0 (92.8%)"),
         ("naive_is_low & n_poss==2", (rdf["naive_is_high"] == 0) & (rdf["n_possible_f"] == 2), "clamp -1→0 (0.1%)"),
-        ("naive_is_high", rdf["naive_is_high"] == 1, "clamp +1→0 (5.4%)"),
+        ("naive_is_high == 1", rdf["naive_is_high"] == 1, "clamp +1→0 (5.4%)"),
         ("metar_above_boundary", rdf["metar_above_boundary"] == 1, "clamp -1→0 (0.0%)"),
         ("metar_gap_c >= 0.25", rdf["metar_gap_c"] >= 0.25, "force +1 (100%)"),
         ("metar_gap_c >= 0.2 & nih==0", (rdf["metar_gap_c"] >= 0.2) & (rdf["naive_is_high"] == 0), "force +1 (100%)"),
@@ -358,6 +497,12 @@ def deep_analysis(rdf: pd.DataFrame):
         ("vol_1hr<=0.5 & nih==0 & n_poss==2", (rdf["temp_f_volatility_1hr"] <= 0.5) & (rdf["naive_is_high"] == 0) & (rdf["n_possible_f"] == 2), "force 0 (100%?)"),
         ("vol_1hr<=0.5 & nih==1", (rdf["temp_f_volatility_1hr"] <= 0.5) & (rdf["naive_is_high"] == 1), "force -1 (92.3%)"),
         ("consec>=30 & nih==0", (rdf["consec_count"] >= 30) & (rdf["naive_is_high"] == 0), "force +1 (90.4%)"),
+        ("gap_below==1", rdf["peak_edge_f_gap_below"] == 1, "clamp -1→0 (0.3%)"),
+        ("gap_above==1", rdf["peak_edge_f_gap_above"] == 1, "clamp +1→0 (6.1%)"),
+        ("metar_gap_c<=-0.5 & nih==1", (rdf["metar_gap_c"] <= -0.5) & (rdf["naive_is_high"] == 1), "force -1 (89.3%)"),
+        ("dwell>=20 & nih==0", (rdf["dwell_count"] >= 20) & (rdf["naive_is_high"] == 0), "force +1 (82.0%)"),
+        ("vol_1hr<=0.6 & nih==1", (rdf["temp_f_volatility_1hr"] <= 0.6) & (rdf["naive_is_high"] == 1), "force -1 (83.8%)"),
+        ("metar_confirm>=0.2 & nih==0", (rdf["metar_confirm"] >= 0.2) & (rdf["naive_is_high"] == 0), "force +1 (100%)"),
     ]
 
     for name, mask, desc in rules:

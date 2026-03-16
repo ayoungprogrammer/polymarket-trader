@@ -286,18 +286,25 @@ def plot_momentum(
     metar_6h_f: Optional[float] = None,
     bracket: Optional[List[int]] = None,
     bracket_probs: Optional[List[dict]] = None,
+    bracket_error: Optional[str] = None,
+    peak_result: Optional[dict] = None,
+    metar_6h_local_dt: Optional[object] = None,
 ):
     """Plot temperature + MA crossover and save to file.
 
     *bracket_probs*: list of dicts from bracket model, each with keys
     ``bracket`` (lo, hi), ``prob``, ``stage1_prob``, ``confidence``.
 
+    *peak_result*: dict from peak_model.predict() with keys
+    ``probability``, ``prediction``, ``cur_naive_f``.
+
     Thread-safe: uses _plot_lock to serialize matplotlib calls.
     """
     with _plot_lock:
         _plot_momentum_impl(df, site, output, forecast_df,
                             locked_rate, likely_rate, margin_threshold,
-                            sun_times, metar_6h_f, bracket, bracket_probs)
+                            sun_times, metar_6h_f, bracket, bracket_probs,
+                            bracket_error, peak_result, metar_6h_local_dt)
 
 
 def _plot_momentum_impl(
@@ -312,6 +319,9 @@ def _plot_momentum_impl(
     metar_6h_f: Optional[float] = None,
     bracket: Optional[List[int]] = None,
     bracket_probs: Optional[List[dict]] = None,
+    bracket_error: Optional[str] = None,
+    peak_result: Optional[dict] = None,
+    metar_6h_local_dt: Optional[object] = None,
 ):
     import matplotlib
     matplotlib.use("Agg")
@@ -321,7 +331,8 @@ def _plot_momentum_impl(
     timestamps = pd.to_datetime(df["timestamp"].str[:19]).values
     temps = df["temperature_f"].to_numpy(dtype=float)
     has_bracket_info = bracket_probs and len(bracket_probs) > 0
-    fig_height = 9.5 if has_bracket_info else 8
+    has_bracket_footer = has_bracket_info or bracket_error
+    fig_height = 9.5 if has_bracket_footer else 8
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, fig_height), sharex=True,
                                     gridspec_kw={"height_ratios": [2, 1]})
 
@@ -355,7 +366,9 @@ def _plot_momentum_impl(
         ax1.plot(timestamps, df["ma_long"].values, color="tab:blue", linewidth=2,
                  label=f"MA long ({MA_LONG_MIN}m)")
     ax1.set_ylabel("Temperature (°F)")
-    ax1.set_title(f"{site} — Temperature & MA Crossover")
+    from zoneinfo import ZoneInfo as _ZI
+    _pst_now = pd.Timestamp.now(tz=_ZI("America/Los_Angeles")).strftime("%-I:%M %p %Z")
+    ax1.set_title(f"{site} — Temperature & MA Crossover  (generated {_pst_now})")
     ax1.grid(True, alpha=0.3)
 
     # Forecast overlay
@@ -444,12 +457,26 @@ def _plot_momentum_impl(
         ax1.axhline(y=metar_6h_f, color="magenta", linestyle="-", alpha=0.6, linewidth=1.5,
                      label=f"METAR 6h max: {metar_6h_f:.1f}°F")
 
-    # Predicted bracket — shaded band
+    # METAR 6h report time — vertical line
+    if metar_6h_local_dt is not None:
+        metar_dt = pd.Timestamp(metar_6h_local_dt).tz_localize(None)
+        for ax in (ax1, ax2):
+            ax.axvline(metar_dt, color="magenta", linestyle="--", alpha=0.5, linewidth=1)
+        _sun_markers.append((metar_dt, "magenta", "6h METAR"))
+
+    # Predicted bracket — shaded band (clamp sentinels to visible range)
     if bracket and len(bracket) == 2:
-        ax1.axhspan(bracket[0], bracket[1], color="tab:green", alpha=0.12,
-                     label=f"Predicted bracket: [{bracket[0]}, {bracket[1]}]°F")
-        ax1.axhline(y=bracket[0], color="tab:green", linestyle="-", alpha=0.3, linewidth=0.5)
-        ax1.axhline(y=bracket[1], color="tab:green", linestyle="-", alpha=0.3, linewidth=0.5)
+        ylims = ax1.get_ylim()
+        b_lo = bracket[0] if bracket[0] > -1000 else ylims[0]
+        b_hi = bracket[1] if bracket[1] < 1000 else ylims[1]
+        label_lo = f"{bracket[0]}" if bracket[0] > -1000 else "≤"
+        label_hi = f"{bracket[1]}" if bracket[1] < 1000 else "≥"
+        ax1.axhspan(b_lo, b_hi, color="tab:green", alpha=0.12,
+                     label=f"Predicted bracket: [{label_lo}, {label_hi}]°F")
+        if bracket[0] > -1000:
+            ax1.axhline(y=b_lo, color="tab:green", linestyle="-", alpha=0.3, linewidth=0.5)
+        if bracket[1] < 1000:
+            ax1.axhline(y=b_hi, color="tab:green", linestyle="-", alpha=0.3, linewidth=0.5)
 
     ax1.legend(loc="upper left", fontsize=8)
 
@@ -490,19 +517,55 @@ def _plot_momentum_impl(
 
     # Bracket model probabilities table at bottom of figure
     if has_bracket_info:
-        lines = ["Bracket Model Predictions:"]
-        lines.append(f"  {'Bracket':<12} {'Stage1':>8} {'Final':>8}")
-        lines.append(f"  {'─'*12} {'─'*8} {'─'*8}")
+        # Extract offset detail from first result (same for all brackets)
+        od = bracket_probs[0].get("offset_detail") if bracket_probs else None
+        # Current max °F from observations
+        cur_max_f = int(round(float(df["temperature_f"].max())))
+        lines = [f"Bracket Model — Current max: {cur_max_f}°F"]
+        if od:
+            s1 = od["stage1"]
+            s2 = od["stage2"]
+            ov = od["override"]
+            reasons = od.get("override_reasons", {})
+            lines.append(f"  {'Offset':<8s} {'Stage1':>8s} {'Stage2':>8s} {'Final':>8s}  {'Override'}")
+            lines.append(f"  {'─'*8} {'─'*8} {'─'*8} {'─'*8}  {'─'*30}")
+            for k, label in [(-1, "P(−1)"), (0, "P(0)"), (1, "P(+1)")]:
+                r = "; ".join(reasons.get(k, []))
+                lines.append(f"  {label:<8s} {s1[k]:>8.1%} {s2[k]:>8.1%} {ov[k]:>8.1%}  {r}")
+        lines.append("")
+        lines.append(f"  {'Bracket':<12} {'S1':>6} {'S2':>6} {'Final':>6}")
+        lines.append(f"  {'─'*12} {'─'*6} {'─'*6} {'─'*6}")
         for bp in bracket_probs:
             blo, bhi = bp["bracket"]
             s1 = bp.get("stage1_prob", 0.0)
+            s2 = bp.get("stage2_prob", 0.0)
             final = bp["prob"]
             marker = " ◄" if bracket and [blo, bhi] == bracket else ""
-            lines.append(f"  [{blo}, {bhi}]°F   {s1:>7.0%}  {final:>7.0%}{marker}")
-        fig.subplots_adjust(bottom=0.18)
-        fig.text(0.02, 0.005, "\n".join(lines), fontsize=9, fontfamily="monospace",
+            lo_s = f"≤" if blo <= -1000 else str(blo)
+            hi_s = f"≥" if bhi >= 1000 else str(bhi)
+            lines.append(f"  [{lo_s},{hi_s}]°F   {s1:>5.0%}  {s2:>5.0%}  {final:>5.0%}{marker}")
+        fig.subplots_adjust(bottom=0.28)
+        fig.text(0.02, 0.005, "\n".join(lines), fontsize=7.5, fontfamily="monospace",
                  va="bottom", ha="left",
                  bbox=dict(boxstyle="round,pad=0.4", facecolor="lightyellow", alpha=0.8))
+    elif bracket_error:
+        fig.subplots_adjust(bottom=0.15)
+        fig.text(0.02, 0.005, f"Bracket Model: {bracket_error}", fontsize=8,
+                 fontfamily="monospace", va="bottom", ha="left",
+                 bbox=dict(boxstyle="round,pad=0.4", facecolor="mistyrose", alpha=0.8))
+
+    # Peak model prediction — bottom right
+    if peak_result is not None:
+        prob = peak_result["probability"]
+        naive_f = peak_result["cur_naive_f"]
+        verdict = "YES" if peak_result["prediction"] else "NO"
+        color = "limegreen" if prob < 0.3 else ("orange" if prob < 0.7 else "tomato")
+        peak_text = (f"Peak Model: +1°F?\n"
+                     f"  Current: {naive_f}°F\n"
+                     f"  P(increase): {prob:.0%}  → {verdict}")
+        fig.text(0.98, 0.005, peak_text, fontsize=8, fontfamily="monospace",
+                 va="bottom", ha="right",
+                 bbox=dict(boxstyle="round,pad=0.4", facecolor=color, alpha=0.25))
 
     plt.savefig(output, dpi=150)
     plt.close()
@@ -635,6 +698,22 @@ def main():
     except Exception as e:
         print(f"Could not fetch sun times: {e}")
 
+    # METAR 6h report time
+    metar_6h_local_dt = None
+    try:
+        from weather.sites import get_site_config
+        site_cfg = get_site_config(args.site)
+        metar_utc_str = site_cfg.get("metar_6h_utc")
+        if metar_utc_str and coords:
+            from zoneinfo import ZoneInfo as _ZI2
+            _stz = _ZI2(coords[2])
+            _today = _dt.now(_stz).date()
+            _hh, _mm = int(metar_utc_str.split(":")[0]), int(metar_utc_str.split(":")[1])
+            metar_utc_dt = _dt(_today.year, _today.month, _today.day, _hh, _mm, tzinfo=_ZI2("UTC"))
+            metar_6h_local_dt = metar_utc_dt.astimezone(_stz)
+    except Exception as e:
+        print(f"Could not compute METAR 6h time: {e}")
+
     # Plot
     try:
         from bot.app import MOMENTUM_PARAMS_FAST, MOMENTUM_PARAMS_WIDE
@@ -645,7 +724,7 @@ def main():
         lr, mt, ll = -0.5, 2.0, -0.2
     plot_momentum(df, args.site, output=args.output, forecast_df=forecast_df,
                   locked_rate=lr, likely_rate=ll, margin_threshold=mt,
-                  sun_times=sun_times)
+                  sun_times=sun_times, metar_6h_local_dt=metar_6h_local_dt)
 
     # Optional CSV
     if args.csv:
