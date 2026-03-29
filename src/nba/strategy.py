@@ -48,6 +48,60 @@ MIN_PROFILE_GAMES = 12
 CROSS_TEAM_RHO_Q4 = 0.074  # corr(home_Q4, away_Q4)
 CROSS_TEAM_RHO_H2 = 0.145  # corr(home_H2, away_H2)
 
+# NOTE: Q3 margin does NOT predict Q4 scoring (r=-0.016, p=0.31, N=943 regulation
+# games). Tight games (0-4 pt margin) average 54.6 combined Q4 vs 55.2 overall —
+# <1 point difference, not significant. No close-game adjustment is warranted.
+
+# NBA tricode → common name(s) for matching Kalshi market titles.
+# Values are lowercase substrings that would appear in a Kalshi title.
+TEAM_NAMES = {
+    "ATL": ["hawks", "atlanta"],
+    "BOS": ["celtics", "boston"],
+    "BKN": ["nets", "brooklyn"],
+    "CHA": ["hornets", "charlotte"],
+    "CHI": ["bulls", "chicago"],
+    "CLE": ["cavaliers", "cavs", "cleveland"],
+    "DAL": ["mavericks", "mavs", "dallas"],
+    "DEN": ["nuggets", "denver"],
+    "DET": ["pistons", "detroit"],
+    "GSW": ["warriors", "golden state"],
+    "HOU": ["rockets", "houston"],
+    "IND": ["pacers", "indiana"],
+    "LAC": ["clippers", "la clippers"],
+    "LAL": ["lakers", "la lakers", "los angeles lakers"],
+    "MEM": ["grizzlies", "memphis"],
+    "MIA": ["heat", "miami"],
+    "MIL": ["bucks", "milwaukee"],
+    "MIN": ["timberwolves", "wolves", "minnesota"],
+    "NOP": ["pelicans", "new orleans"],
+    "NYK": ["knicks", "new york"],
+    "OKC": ["thunder", "oklahoma"],
+    "ORL": ["magic", "orlando"],
+    "PHI": ["76ers", "sixers", "philadelphia"],
+    "PHX": ["suns", "phoenix"],
+    "POR": ["trail blazers", "blazers", "portland"],
+    "SAC": ["kings", "sacramento"],
+    "SAS": ["spurs", "san antonio"],
+    "TOR": ["raptors", "toronto"],
+    "UTA": ["jazz", "utah"],
+    "WAS": ["wizards", "washington"],
+}
+
+
+def _title_matches_game(title: str, home: str, away: str) -> bool:
+    """Check if a Kalshi market title references this game.
+
+    Matches on tricode or any known team name substring.
+    """
+    title_lower = title.lower()
+    home_match = home.lower() in title_lower or any(
+        n in title_lower for n in TEAM_NAMES.get(home, [])
+    )
+    away_match = away.lower() in title_lower or any(
+        n in title_lower for n in TEAM_NAMES.get(away, [])
+    )
+    return home_match or away_match
+
 
 # ---------------------------------------------------------------------------
 # Game Total Projection
@@ -849,7 +903,7 @@ def watch_checkpoints(
     stop_event: Optional[threading.Event] = None,
     kalshi_client=None,
 ) -> None:
-    """Poll live games and send Telegram alerts at halftime and Q4 start.
+    """Poll live games and send Telegram alerts at end of Q2 and end of Q3.
 
     At each checkpoint, runs project_halftime_total() to get projected total
     and calibrated_std, then computes high-confidence OVER/UNDER lines.
@@ -983,34 +1037,36 @@ def watch_checkpoints(
             gid = game["game_id"]
             period = game.get("period", 0)
             clock = game.get("clock", "")
-            home = game["home_team"]
-            away = game["away_team"]
             label = _game_label(game)
 
             if gid not in notified:
                 notified[gid] = set()
 
-            # Detect halftime: period 2 ended (clock empty) or already in Q3+
-            if "halftime" not in notified[gid]:
-                is_halftime = (period == 2 and not clock) or period >= 3
-                if is_halftime:
-                    glog.info("[%s] >>> Sending HALFTIME alert", label)
-                    _send_checkpoint_alert(
-                        game, profiles_ha, "HALFTIME", z, conf_pct,
-                    )
-                    _try_edge_scan(game, profiles_ha, kalshi_client, label, "HALFTIME")
-                    notified[gid].add("halftime")
+            prev = game_state.get(gid)
+            prev_period = prev["period"] if prev else 0
 
-            # Detect Q4 start: period 3 ended (clock empty) or already in Q4+
-            if "q4" not in notified[gid]:
-                is_q4 = (period == 3 and not clock) or period >= 4
-                if is_q4:
-                    glog.info("[%s] >>> Sending Q4 START alert", label)
+            # Detect end of Q2: period just transitioned past 2
+            # (prev_period ≤ 2 and now period ≥ 3 means Q2 ended between polls)
+            if "end_q2" not in notified[gid]:
+                is_end_q2 = (period == 2 and not clock) or (prev_period <= 2 and period >= 3)
+                if is_end_q2:
+                    glog.info("[%s] >>> Sending END OF Q2 alert", label)
                     _send_checkpoint_alert(
-                        game, profiles_ha, "Q4 START", z, conf_pct,
+                        game, profiles_ha, "END OF Q2", z, conf_pct,
                     )
-                    _try_edge_scan(game, profiles_ha, kalshi_client, label, "Q4 START")
-                    notified[gid].add("q4")
+                    _try_edge_scan(game, profiles_ha, kalshi_client, label, "END OF Q2")
+                    notified[gid].add("end_q2")
+
+            # Detect end of Q3: period just transitioned past 3
+            if "end_q3" not in notified[gid]:
+                is_end_q3 = (period == 3 and not clock) or (prev_period <= 3 and period >= 4)
+                if is_end_q3:
+                    glog.info("[%s] >>> Sending END OF Q3 alert", label)
+                    _send_checkpoint_alert(
+                        game, profiles_ha, "END OF Q3", z, conf_pct,
+                    )
+                    _try_edge_scan(game, profiles_ha, kalshi_client, label, "END OF Q3")
+                    notified[gid].add("end_q3")
 
         stop_event.wait(poll_interval)
 
@@ -1030,6 +1086,7 @@ def _send_checkpoint_alert(
     hs = game["home_score"]
     as_ = game["away_score"]
     total = hs + as_
+    margin = abs(hs - as_)
 
     proj = project_halftime_total(game, profiles_ha)
     if not proj:
@@ -1048,7 +1105,7 @@ def _send_checkpoint_alert(
 
     msg = (
         f"<b>{label}: {away} {as_} - {home} {hs}</b>\n"
-        f"Total: {total} | Pace: {pace:.2f} | Projected: {projected} ±{cal_std}\n\n"
+        f"Total: {total} | Margin: {margin} | Pace: {pace:.2f} | Projected: {projected} ±{cal_std}\n\n"
         f"<b>Game Total:</b>\n"
         f"  <b>OVER {over_line}</b> — profitable up to ~{conf_pct}¢\n"
         f"  <b>UNDER {under_line}</b> — profitable up to ~{conf_pct}¢\n"
@@ -1060,9 +1117,9 @@ def _send_checkpoint_alert(
     if hp and ap:
         # Use the checkpoint implied by the label, not the current period
         # (period may have advanced past the checkpoint by the time we poll)
-        if "HALFTIME" in label:
+        if "Q2" in label or "HALFTIME" in label:
             completed = 2
-        elif "Q4" in label:
+        elif "Q3" in label or "Q4" in label:
             completed = 3
         else:
             completed = min(game.get("period", 0), 4)
@@ -1108,10 +1165,13 @@ def _send_checkpoint_alert(
             f"[OVER {away_over} / UNDER {away_under}]\n"
         )
 
-    msg += f"({conf_pct}% confidence lines)"
+    msg += (
+        f"({conf_pct}% confidence lines)\n"
+        f'<a href="https://kalshi.com/events/nba">View on Kalshi</a>'
+    )
 
-    log.info("[NBA-ALERTS] %s: %s %d - %s %d | proj=%.1f ±%.1f | OVER %.1f / UNDER %.1f",
-             label, away, as_, home, hs, projected, cal_std, over_line, under_line)
+    log.info("[NBA-ALERTS] %s: %s %d - %s %d (margin %d) | proj=%.1f ±%.1f | OVER %.1f / UNDER %.1f",
+             label, away, as_, home, hs, margin, projected, cal_std, over_line, under_line)
     if hp and ap:
         log.info("[NBA-ALERTS] %s: %s(home) proj=%.1f [OVER %.1f / UNDER %.1f] | "
                  "%s(away) proj=%.1f [OVER %.1f / UNDER %.1f]",
@@ -1177,8 +1237,9 @@ def _try_edge_scan(
     top = edges[:5]
     lines = [f"<b>{checkpoint} Edges ({game['away_team']}@{game['home_team']}):</b>"]
     for e in top:
+        url = f"https://kalshi.com/markets/{e['ticker'].lower()}"
         lines.append(
-            f"  {e['side'].upper()} {e['line']} @ {e['ask_cents']}¢ — "
+            f"  <a href=\"{url}\">{e['side'].upper()} {e['line']}</a> @ {e['ask_cents']}¢ — "
             f"model {e['model_prob']}% — edge +{e['edge_pct']}%"
         )
     _send_telegram("\n".join(lines))
@@ -1233,7 +1294,7 @@ def _scan_checkpoint_edges(
         if parsed.get("side") not in ("over", "under") or parsed.get("player"):
             continue
         title = mkt.get("title", "") + " " + mkt.get("subtitle", "")
-        if home not in title and away not in title:
+        if not _title_matches_game(title, home, away):
             continue
 
         line = parsed["line"]

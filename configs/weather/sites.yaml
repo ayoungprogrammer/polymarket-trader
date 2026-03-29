@@ -1,0 +1,169 @@
+KLAX:
+  city: Los Angeles
+  kalshi_suffix: LAX
+  lat: 33.9381
+  lon: -118.3889
+  timezone: America/Los_Angeles
+  cli_prelim_local: "17:00"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["15:07"]
+
+KMIA:
+  city: Miami
+  kalshi_suffix: MIA
+  lat: 25.7954
+  lon: -80.2901
+  timezone: America/New_York
+  cli_prelim_local: "16:25"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["03:21", "16:11", "17:11"]
+
+KSFO:
+  city: San Francisco
+  kalshi_suffix: TSFO
+  lat: 37.6188
+  lon: -122.3647
+  timezone: America/Los_Angeles
+  cli_prelim_local: "17:00"
+  cli_final_local: "01:30"
+  dsm_drop_local: ["05:16"]
+
+KMDW:
+  city: Chicago
+  kalshi_suffix: CHI
+  lat: 41.7868
+  lon: -87.7455
+  timezone: America/Chicago
+  cli_prelim_local: "16:35"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["16:16", "17:16"]
+
+KDEN:
+  city: Denver
+  kalshi_suffix: DEN
+  lat: 39.8482
+  lon: -104.6738
+  timezone: America/Denver
+  cli_prelim_local: "17:30"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["06:16", "16:16", "17:16"]
+
+KPHX:
+  city: Phoenix
+  kalshi_suffix: TPHX
+  lat: 33.4355
+  lon: -111.9981
+  timezone: America/Phoenix
+  cli_prelim_local: "17:00"
+  cli_final_local: "01:30"
+  dsm_drop_local: ["08:08", "16:08"]
+
+KOKC:
+  city: Oklahoma City
+  kalshi_suffix: TOKC
+  lat: 35.3931
+  lon: -97.6009
+  timezone: America/Chicago
+  cli_prelim_local: "17:10"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["16:02", "17:02", "18:02"]
+
+KATL:
+  city: Atlanta
+  kalshi_suffix: TATL
+  lat: 33.6367
+  lon: -84.4279
+  timezone: America/New_York
+  cli_prelim_local: "16:30"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["16:16"]
+
+KDFW:
+  city: Dallas
+  kalshi_suffix: TDAL
+  lat: 32.8972
+  lon: -97.0377
+  timezone: America/Chicago
+  cli_prelim_local: "16:30"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["16:06", "17:06"]
+
+KSAT:
+  city: San Antonio
+  kalshi_suffix: TSATX
+  lat: 29.5338
+  lon: -98.47
+  timezone: America/Chicago
+  cli_prelim_local: "17:35"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["07:15", "16:15", "17:15"]
+
+KHOU:
+  city: Houston
+  kalshi_suffix: THOU
+  lat: 29.6458
+  lon: -95.2772
+  timezone: America/Chicago
+  cli_prelim_local: "16:20"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["07:01", "16:01", "17:01"]
+
+KMSP:
+  city: Minneapolis
+  kalshi_suffix: TMIN
+  lat: 44.882
+  lon: -93.2218
+  timezone: America/Chicago
+  cli_prelim_local: "16:30"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["16:15", "17:15"]
+
+KDCA:
+  city: Washington DC
+  kalshi_suffix: TDC
+  lat: 38.8894
+  lon: -77.0351
+  timezone: America/New_York
+  cli_prelim_local: "17:20"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["17:11"]
+
+KAUS:
+  city: Austin
+  kalshi_suffix: TAUS
+  lat: 30.1945
+  lon: -97.6699
+  timezone: America/Chicago
+  cli_prelim_local: "17:35"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["07:16", "16:16", "17:16"]
+
+KBOS:
+  city: Boston
+  kalshi_suffix: TBOS
+  lat: 42.3656
+  lon: -71.0096
+  timezone: America/New_York
+  cli_prelim_local: "17:25"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["16:16", "17:16"]
+
+KPHL:
+  city: Philadelphia
+  kalshi_suffix: PHIL
+  lat: 39.8721
+  lon: -75.2411
+  timezone: America/New_York
+  cli_prelim_local: "17:40"
+  cli_final_local: "04:00"
+  dsm_drop_local: ["09:31", "17:16"]
+
+KSEA:
+  city: Seattle
+  kalshi_suffix: TSEA
+  lat: 47.4502
+  lon: -122.3088
+  timezone: America/Los_Angeles
+  cli_prelim_local: "17:00"
+  cli_final_local: "01:30"
+  dsm_drop_local: ["09:31"]

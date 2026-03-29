@@ -145,3 +145,33 @@ SUMMARY: PERFECT OR NEAR-PERFECT RULES
   gap_above==1                                  n= 358  -1=43.9%  0=50.0%  +1= 6.1%  clamp +1→0 (94%)
   metar_gap_c<=-0.5 & nih==1                    n= 178  -1=89.3%  0= 9.6%  +1= 1.1%  force -1 (89.3%)
   metar_confirm>=0.2 & nih==0                   n= 183  -1= 0.0%  0= 0.0%  +1=100.0%  force +1 (100%)
+
+
+
+==============================================================================
+  LEAVE-ONE-SITE-OUT CROSS-VALIDATION (Kalshi sites)
+  Training sites (99) always in training set
+==============================================================================
+  Site         N  Majority%  Best Acc%               Best
+  -------- ----- ---------- ---------- ------------------
+  KATL       180     71.1%     85.6% LogisticRegression
+  KAUS       180     71.7%     86.7% LogisticRegression
+  KBOS       180     73.9%     90.0%       RandomForest
+  KDCA       177     71.8%     84.7% LogisticRegression
+  KDEN       179     69.8%     89.4%       RandomForest
+  KDFW       180     68.9%     88.3%   GradientBoosting
+  KHOU       175     73.7%     82.9% LogisticRegression
+  KLAX       179     71.5%     79.9% LogisticRegression
+  KMDW       179     73.7%     87.2%       RandomForest
+  KMIA       180     76.1%     87.8% LogisticRegression
+  KMSP       180     73.3%     87.8%   GradientBoosting
+  KOKC       179     70.4%     88.8% LogisticRegression
+  KPHL       172     69.8%     86.0%   GradientBoosting
+  KPHX       179     85.5%     90.5%   GradientBoosting
+  KSAT       179     71.5%     90.5%       RandomForest
+  KSEA       180     65.6%     85.0% LogisticRegression
+  KSFO       180     73.3%     85.0%       RandomForest
+
+
+
+python src/weather/backtest_rounding.py --use-all-sites --stage1-only --tune --since 2025-11-01

@@ -23,7 +23,7 @@ import pandas as pd
 from paths import project_path
 from weather.prediction import compute_momentum, predict_settlement_f
 
-DATA_DIR = project_path("data")
+DATA_DIR = project_path("data", "weather")
 
 from weather.sites import ALL_SITES
 
@@ -40,11 +40,33 @@ def load_site_history(site: str) -> pd.DataFrame:
     df["temperature_c"] = pd.to_numeric(df.get("temperature_c"), errors="coerce")
     if "max_temp_24h_f" in df.columns:
         df["max_temp_24h_f"] = pd.to_numeric(df["max_temp_24h_f"], errors="coerce")
+    if "max_temp_6h_f" not in df.columns:
+        raise ValueError(
+            f"history_{site}.csv missing max_temp_6h_f column — "
+            "re-fetch with: python src/weather/analysis.py"
+        )
+    df["max_temp_6h_f"] = pd.to_numeric(df["max_temp_6h_f"], errors="coerce")
     for col in ["wind_speed_mph", "dewpoint_f", "relative_humidity_pct",
                 "sea_level_pressure", "pressure_tendency"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df["date"] = df["ts"].dt.date
+
+    # Trim each day to start after the early-morning 24h METAR (~00:53 local).
+    # The 24h METAR reports the PREVIOUS day's max/min, so rows from midnight
+    # to that METAR are the tail of yesterday's cooling curve.  Only consider
+    # METARs before 02:00 (the 23:53 ones are same-day data).
+    if "max_temp_24h_f" in df.columns:
+        keep = []
+        for _, day_df in df.groupby("date"):
+            early = day_df[(day_df["max_temp_24h_f"].notna()) & (day_df["ts"].dt.hour < 2)]
+            if len(early) > 0:
+                first_metar_pos = early.index[0]
+                keep.append(day_df.loc[day_df.index > first_metar_pos])
+            else:
+                keep.append(day_df)
+        if keep:
+            df = pd.concat(keep)
     return df
 
 
@@ -61,7 +83,13 @@ def precompute_day_momentum(day_df: pd.DataFrame) -> dict:
     n = len(day_df)
 
     # Running max (observed max up to each point)
-    running_max = np.maximum.accumulate(temps)
+    # Use np.fmax to propagate the previous max over NaN gaps
+    running_max = np.full(n, np.nan)
+    cur_max = -np.inf
+    for i in range(n):
+        if not np.isnan(temps[i]):
+            cur_max = max(cur_max, temps[i])
+        running_max[i] = cur_max if cur_max > -np.inf else np.nan
 
     # Actual end-of-day high and its hour (proxy for forecast peak)
     actual_high = float(np.nanmax(temps))
@@ -96,12 +124,15 @@ def precompute_day_momentum(day_df: pd.DataFrame) -> dict:
         if cur_metar_max > -np.inf:
             running_metar_max_c[i] = cur_metar_max
 
-    # True daily high: prefer 24h ASOS max (settlement-grade), fall back to obs max
-    true_high = actual_high
-    if "max_temp_24h_f" in day_df.columns:
-        val_24h = pd.to_numeric(day_df["max_temp_24h_f"], errors="coerce").max()
-        if not np.isnan(val_24h):
-            true_high = float(val_24h)
+    # True daily high from 6h METARs (settlement-grade, correctly day-scoped)
+    # Skip any 6h METAR before 01:00 — it covers the previous evening window
+    if "max_temp_6h_f" not in day_df.columns:
+        raise ValueError("max_temp_6h_f column missing — re-fetch history data")
+    _m6h = day_df[day_df["max_temp_6h_f"].notna() & (day_df["ts"].dt.hour >= 1)]
+    val_6h = pd.to_numeric(_m6h["max_temp_6h_f"], errors="coerce").max() if not _m6h.empty else np.nan
+    if np.isnan(val_6h):
+        raise ValueError("No daytime 6h METAR readings in day — cannot determine settlement label")
+    true_high = float(val_6h)
 
     actual_settlement_f = round(true_high)
 
@@ -118,6 +149,7 @@ def precompute_day_momentum(day_df: pd.DataFrame) -> dict:
         "running_auto_max_c": running_auto_max_c,
         "running_metar_max_c": running_metar_max_c,
         "n": n,
+        "_mom_df": mom_df,
     }
 
 

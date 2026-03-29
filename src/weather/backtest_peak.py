@@ -31,13 +31,14 @@ import pandas as pd
 
 from paths import project_path
 from weather.backtest import load_site_history, precompute_day_momentum, ALL_SITES
+from weather.backtest_rounding import ALL_SITES_WITH_TRAINING
 from weather.backtest_rounding import SOLAR_NOON_CSV
 
-DATA_DIR = project_path("data")
+DATA_DIR = project_path("data", "weather")
 MODEL_DIR = project_path("models", "peak_model")
 MODEL_PATH = os.path.join(MODEL_DIR, "model.pkl")
-FORECAST_HIGHS_CSV = project_path("data", "forecast_highs.csv")
-FORECAST_HOURLY_CSV = project_path("data", "forecast_hourly.csv")
+FORECAST_HIGHS_CSV = project_path("data", "weather", "forecast_highs.csv")
+FORECAST_HOURLY_CSV = project_path("data", "weather", "forecast_hourly.csv")
 
 LABEL = "will_increase_f"
 
@@ -158,6 +159,8 @@ def extract_peak_features(
     cur_naive_f = round(cur_f_float)
     actual_naive_f = round(actual_max_c * 9.0 / 5.0 + 32.0)
     will_increase = int(actual_naive_f >= cur_naive_f + 1)
+    will_increase_2 = int(actual_naive_f >= cur_naive_f + 2)
+    will_not_decrease = int(actual_naive_f >= cur_naive_f)
 
     # --- Rounding features (3) ---
     # How close cur_max_c is to the next °F flip (0 = right on boundary, 0.5 = far)
@@ -168,6 +171,33 @@ def extract_peak_features(
     n_possible_f = len(c_to_possible_f(int(cur_max_c)))
     # Fractional part of C→F conversion (asymmetric: high frac = closer to rounding up)
     cur_f_fractional = frac
+
+    # --- METAR features (5) ---
+    # Computed from running METAR max at the sample point
+    running_metar_max_c = precomp["running_metar_max_c"]
+    cur_metar_max_c = running_metar_max_c[as_of_idx]
+    _max_c_int = int(cur_max_c)
+    _possible_f = c_to_possible_f(_max_c_int)
+
+    if not np.isnan(cur_metar_max_c) and (cur_metar_max_c >= cur_max_c - 2.0):
+        # Only use METAR when it's near the auto peak (within 2°C).
+        # Morning METARs far below the peak are noise, not signal.
+        has_metar = 1.0
+        metar_gap_c = cur_metar_max_c - cur_max_c  # positive = METAR above auto
+        metar_confirm = min(max(metar_gap_c, 0.0), 1.0)  # clamped [0, 1]
+        if len(_possible_f) == 2:
+            boundary_c = (_possible_f[0] + 0.5 - 32) * 5.0 / 9.0
+            metar_above_boundary = 1.0 if cur_metar_max_c > boundary_c else 0.0
+            metar_boundary_margin_c = cur_metar_max_c - boundary_c
+        else:
+            metar_above_boundary = 0.0
+            metar_boundary_margin_c = 0.0
+    else:
+        has_metar = 0.0
+        metar_gap_c = 0.0
+        metar_confirm = 0.0
+        metar_above_boundary = 0.0
+        metar_boundary_margin_c = 0.0
 
     # --- Time features (5) ---
     ts_arr = day_df["ts"].values
@@ -225,6 +255,24 @@ def extract_peak_features(
             break
     max_decline_from_peak = cur_max - cur_temp
 
+    # Composite decline score: 0 = no evidence of decline, 1 = strong decline
+    # Combines: negative rate, negative MA cross, drop from peak, consecutive declines
+    _decline_signals = 0.0
+    _decline_count = 0
+    if cur_rate < -1.0:          # cooling > 1°F/hr
+        _decline_signals += min(abs(cur_rate) / 5.0, 1.0)
+        _decline_count += 1
+    if cur_ma_cross < -0.5:      # MA cross negative
+        _decline_signals += min(abs(cur_ma_cross) / 3.0, 1.0)
+        _decline_count += 1
+    if max_decline_from_peak > 1.0:  # dropped > 1°F from peak
+        _decline_signals += min(max_decline_from_peak / 5.0, 1.0)
+        _decline_count += 1
+    if n_declining >= 3:         # 3+ consecutive declining readings
+        _decline_signals += min(n_declining / 10.0, 1.0)
+        _decline_count += 1
+    decline_confidence = _decline_signals / max(_decline_count, 1)
+
     # --- Peak shape (4) ---
     readings_at_max = int(np.sum(np.abs(temps[:as_of_idx + 1] - cur_max) < 0.01))
     at_max_indices = np.where(np.abs(temps[:as_of_idx + 1] - cur_max) < 0.01)[0]
@@ -277,6 +325,7 @@ def extract_peak_features(
     # Derived from hourly Open-Meteo historical forecast
     fcst_hours_since_peak = 0.0
     fcst_peak_hour = 14.0  # fallback
+    fcst_remaining_vs_cur = 0.0
     fcst_near_peak_1f = 0
     fcst_near_peak_2f = 0
     fcst_slope_at_t = 0.0
@@ -296,6 +345,8 @@ def extract_peak_features(
     fcst_tracking_rmse = 0.0    # RMSE of obs vs forecast so far
     fcst_tracking_max_err = 0.0 # worst |obs - forecast| deviation so far
     fcst_obs_above_pct = 0.5    # fraction of matched hours where obs > forecast
+    fcst_tracking_bias_1h = 0.0 # mean(obs - forecast) for the last hour only
+    fcst_tracking_rmse_1h = 0.0 # RMSE for the last hour only
 
     if forecast_hourly and len(forecast_hourly) >= 6:
         fh_hours = np.array([h for h, _ in forecast_hourly], dtype=float)
@@ -304,6 +355,11 @@ def extract_peak_features(
         fcst_peak_temp = fh_temps[fcst_peak_idx]
         fcst_peak_hour = fh_hours[fcst_peak_idx]
         fcst_hours_since_peak = cur_hour - fcst_peak_hour
+
+        # Forecast remaining max: highest forecast temp from current hour onward
+        future_mask = fh_hours >= cur_hour
+        fcst_remaining_max = float(fh_temps[future_mask].max()) if future_mask.any() else float(fh_temps[-1])
+        fcst_remaining_vs_cur = fcst_remaining_max - cur_max
 
         # Hours within 1°F / 2°F of forecast peak
         fcst_near_peak_1f = int(np.sum(np.abs(fh_temps - fcst_peak_temp) <= 1.0))
@@ -377,6 +433,21 @@ def extract_peak_features(
             fcst_tracking_max_err = float(np.max(np.abs(err_arr)))
             fcst_obs_above_pct = float(np.mean(err_arr > 0))
 
+        # Last-hour tracking: forecast accuracy in the most recent hour only
+        recent_errors = []
+        for fi in range(len(fh_hours)):
+            fh = fh_hours[fi]
+            if fh > cur_hour or fh < cur_hour - 1.0:
+                continue
+            diffs = np.abs(hours[:as_of_idx + 1] - fh)
+            closest = int(np.argmin(diffs))
+            if diffs[closest] < 0.75:
+                recent_errors.append(temps[closest] - fh_temps[fi])
+        if len(recent_errors) >= 1:
+            re_arr = np.array(recent_errors)
+            fcst_tracking_bias_1h = float(np.mean(re_arr))
+            fcst_tracking_rmse_1h = float(np.sqrt(np.mean(re_arr ** 2)))
+
     # --- Yesterday's weather (6) ---
     yest = yesterday or {}
     yest_high_f = yest.get("high_f", cur_max)
@@ -412,6 +483,7 @@ def extract_peak_features(
         "accel_change": round(accel_change, 3),
         "n_declining_readings": n_declining,
         "max_decline_from_peak": round(max_decline_from_peak, 2),
+        "decline_confidence": round(decline_confidence, 3),
         # Peak shape (4)
         "readings_at_max": readings_at_max,
         "time_at_max_hours": round(time_at_max_hours, 3),
@@ -436,6 +508,8 @@ def extract_peak_features(
         # Forecast curve (7)
         "fcst_hours_since_peak": round(fcst_hours_since_peak, 3),
         "fcst_peak_hour": round(fcst_peak_hour, 1),
+        "fcst_peak_before_sunrise": 1.0 if fcst_peak_hour < (solar_noon_hour - 6) else 0.0,
+        "fcst_remaining_vs_cur": round(fcst_remaining_vs_cur, 2),
         "fcst_near_peak_1f": fcst_near_peak_1f,
         "fcst_near_peak_2f": fcst_near_peak_2f,
         "fcst_slope_at_t": round(fcst_slope_at_t, 2),
@@ -453,10 +527,18 @@ def extract_peak_features(
         "fcst_tracking_rmse": round(fcst_tracking_rmse, 3),
         "fcst_tracking_max_err": round(fcst_tracking_max_err, 3),
         "fcst_obs_above_pct": round(fcst_obs_above_pct, 4),
+        "fcst_tracking_bias_1h": round(fcst_tracking_bias_1h, 3),
+        "fcst_tracking_rmse_1h": round(fcst_tracking_rmse_1h, 3),
         # Rounding (3)
         "boundary_distance": round(boundary_distance, 4),
         "n_possible_f": n_possible_f,
         "cur_f_fractional": round(cur_f_fractional, 4),
+        # METAR (5)
+        "has_metar": has_metar,
+        "metar_gap_c": round(metar_gap_c, 4),
+        "metar_confirm": round(metar_confirm, 4),
+        "metar_above_boundary": metar_above_boundary,
+        "metar_boundary_margin_c": round(metar_boundary_margin_c, 4),
         # Yesterday (6)
         "yest_high_f": round(yest_high_f, 2),
         "yest_low_f": round(yest_low_f, 2),
@@ -464,8 +546,10 @@ def extract_peak_features(
         "yest_peak_hour": round(yest_peak_hour, 2),
         "high_delta_f": round(high_delta_f, 2),
         "yest_high_vs_fcst": round(yest_high_vs_fcst, 2),
-        # Label
+        # Labels
         LABEL: will_increase,
+        "will_increase_2f": will_increase_2,
+        "will_not_decrease": will_not_decrease,
     }
 
 
@@ -493,6 +577,7 @@ FEATURE_COLS = [
     "accel_30m", "accel_1h", "accel_2h", "accel_change",
     "n_declining_readings",
     "max_decline_from_peak",
+    "decline_confidence",
     # Peak shape (4)
     "readings_at_max", "time_at_max_hours", "readings_near_max_1f",
     "pct_at_or_near_max",
@@ -506,6 +591,7 @@ FEATURE_COLS = [
     "forecast_gap_f", "forecast_gap_pct", "current_vs_forecast",
     # Forecast curve (7)
     "fcst_hours_since_peak", "fcst_peak_hour",
+    "fcst_peak_before_sunrise", "fcst_remaining_vs_cur",
     "fcst_near_peak_1f", "fcst_near_peak_2f",
     "fcst_slope_at_t", "fcst_accel_at_t", "fcst_plateau_hours",
     # Forecast derivative profile (6)
@@ -514,8 +600,12 @@ FEATURE_COLS = [
     # Forecast tracking accuracy (4)
     "fcst_tracking_bias", "fcst_tracking_rmse",
     "fcst_tracking_max_err", "fcst_obs_above_pct",
+    "fcst_tracking_bias_1h", "fcst_tracking_rmse_1h",
     # Rounding (3)
     "boundary_distance", "n_possible_f", "cur_f_fractional",
+    # METAR (5)
+    "has_metar", "metar_gap_c", "metar_confirm",
+    "metar_above_boundary", "metar_boundary_margin_c",
     # Yesterday (6)
     "yest_high_f", "yest_low_f", "yest_range_f",
     "yest_peak_hour", "high_delta_f", "yest_high_vs_fcst",
@@ -527,16 +617,16 @@ FEATURE_COLS = [
 # ---------------------------------------------------------------------------
 
 def _compute_actual_max_c(day_df: pd.DataFrame) -> Optional[float]:
-    """End-of-day ground truth max °C: prefer 24h ASOS, fall back to max(temp_c)."""
-    if "max_temp_24h_c" in day_df.columns:
-        val = pd.to_numeric(day_df["max_temp_24h_c"], errors="coerce").max()
-        if not np.isnan(val):
-            return float(val)
-    if "temperature_c" in day_df.columns:
-        val = pd.to_numeric(day_df["temperature_c"], errors="coerce").max()
-        if not np.isnan(val):
-            return float(val)
-    return None
+    """End-of-day ground truth max °C from 6h METAR readings (skip before 01:00)."""
+    if "max_temp_6h_c" not in day_df.columns:
+        raise ValueError("max_temp_6h_c column missing — re-fetch history data")
+    _m6h = day_df[day_df["max_temp_6h_c"].notna() & (day_df["ts"].dt.hour >= 1)]
+    if _m6h.empty:
+        return None  # no daytime 6h METAR readings this day
+    val = pd.to_numeric(_m6h["max_temp_6h_c"], errors="coerce").max()
+    if np.isnan(val):
+        return None
+    return float(val)
 
 
 def generate_day_samples(
@@ -605,9 +695,8 @@ def generate_day_samples(
 # Load all samples
 # ---------------------------------------------------------------------------
 
-def load_all_samples(sites: Optional[List[str]] = None) -> pd.DataFrame:
+def load_all_samples(sites: Optional[List[str]] = None, since: Optional[str] = None) -> pd.DataFrame:
     """Load all sites, precompute momentum, generate samples."""
-    from weather.prediction import compute_momentum
 
     if sites is None:
         sites = list(ALL_SITES)
@@ -638,15 +727,22 @@ def load_all_samples(sites: Optional[List[str]] = None) -> pd.DataFrame:
     else:
         print(f"  No hourly forecasts — forecast curve features will use defaults")
 
+    import time as _time
     rng = np.random.RandomState(42)
     all_rows: List[dict] = []
     total_days = 0
     skipped = 0
     n_forecast_hits = 0
     n_fallback = 0
+    _t_load = 0.0
+    _t_precomp = 0.0
+    _t_samples = 0.0
 
     for site in sites:
+        _t_site_start = _time.time()
+        _t0 = _time.time()
         df = load_site_history(site)
+        _t_load += _time.time() - _t0
         if df.empty:
             print(f"  {site}: no data")
             continue
@@ -657,7 +753,8 @@ def load_all_samples(sites: Optional[List[str]] = None) -> pd.DataFrame:
         # Precompute per-day summaries for yesterday features
         all_day_groups = list(df.groupby("date"))
         day_groups = [(date, grp.sort_values("ts").reset_index(drop=True))
-                      for date, grp in all_day_groups if len(grp) >= 200]
+                      for date, grp in all_day_groups
+                      if len(grp) >= 200 and (since is None or str(date) >= since)]
         skipped += len(all_day_groups) - len(day_groups)
         day_groups.sort(key=lambda x: x[0])
 
@@ -700,9 +797,26 @@ def load_all_samples(sites: Optional[List[str]] = None) -> pd.DataFrame:
                 forecast_high_f = forecast_fallback.get(date_str, 70.0)
                 n_fallback += 1
 
+            # Skip data up to any 6h METAR before 01:00 — its max/min
+            # covers the previous evening and contaminates running accumulators.
+            if "max_temp_6h_f" in day_df.columns:
+                _early_metar = day_df[
+                    day_df["max_temp_6h_f"].notna() & (day_df["ts"].dt.hour < 1)
+                ]
+                if not _early_metar.empty:
+                    _cutoff_idx = _early_metar.index[-1] + 1
+                    day_df = day_df.iloc[_cutoff_idx:].reset_index(drop=True)
+                    if len(day_df) < 200:
+                        skipped += 1
+                        prev_summary = day_summaries.get(date_str)
+                        continue
+
+            _t0 = _time.time()
             precomp = precompute_day_momentum(day_df)
-            mom_df = compute_momentum(day_df)
-            precomp["_mom_df"] = mom_df
+            # precompute_day_momentum already calls compute_momentum internally;
+            # reuse its result instead of computing again (O(n²) per day).
+            precomp["_mom_df"] = precomp.get("_mom_df")
+            _t_precomp += _time.time() - _t0
 
             # Determine if this is a positive day (naive_f will shift +1)
             # to oversample it for class balance
@@ -716,22 +830,26 @@ def load_all_samples(sites: Optional[List[str]] = None) -> pd.DataFrame:
                 is_positive_day = False
             oversample = 2 if is_positive_day else 1
 
+            _t0 = _time.time()
             sn = solar_noon_lookup.get((site, str(date)), 12.0)
             fh = forecast_hourly_lookup.get((site, date_str))
             samples = generate_day_samples(
                 site, day_df, precomp, sn, actual_max_c, forecast_high_f, rng,
                 oversample=oversample, forecast_hourly=fh, yesterday=prev_summary)
             all_rows.extend(samples)
+            _t_samples += _time.time() - _t0
             site_days += 1
             prev_summary = day_summaries.get(date_str)
 
         total_days += site_days
-        print(f"  {site}: {site_days} days, {len(all_rows)} total samples so far")
+        _t_site = _time.time() - _t_site_start
+        print(f"  {site}: {site_days} days, {len(all_rows)} samples  ({_t_site:.1f}s)")
         sys.stdout.flush()
 
     print(f"  Total: {total_days} days, {len(all_rows)} samples "
           f"({skipped} days skipped)")
     print(f"  Forecast source: {n_forecast_hits} Open-Meteo, {n_fallback} rolling fallback")
+    print(f"  Timing: load={_t_load:.1f}s  precomp={_t_precomp:.1f}s  samples={_t_samples:.1f}s")
 
     if not all_rows:
         return pd.DataFrame()
@@ -743,88 +861,71 @@ def load_all_samples(sites: Optional[List[str]] = None) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _build_models() -> list:
-    """Return list of (name, model) tuples to sweep."""
-    from sklearn.ensemble import (
-        GradientBoostingClassifier, RandomForestClassifier,
-        AdaBoostClassifier,
-    )
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.tree import DecisionTreeClassifier
+    """Return list of (name, model) tuples."""
+    from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
+    from sklearn.ensemble import HistGradientBoostingClassifier
 
     return [
-        ("GBM", GradientBoostingClassifier(
-            n_estimators=200, max_depth=4, learning_rate=0.1,
-            min_samples_leaf=5, random_state=42)),
-        ("GBM-deep", GradientBoostingClassifier(
-            n_estimators=300, max_depth=6, learning_rate=0.05,
-            min_samples_leaf=10, random_state=42)),
-        ("RandomForest", RandomForestClassifier(
-            n_estimators=200, max_depth=8, min_samples_leaf=5,
-            random_state=42, n_jobs=-1)),
-        ("LogisticRegression", LogisticRegression(
-            max_iter=1000, random_state=42)),
-        ("AdaBoost", AdaBoostClassifier(
-            n_estimators=100, learning_rate=0.1, random_state=42)),
-        ("DecisionTree", DecisionTreeClassifier(
-            max_depth=6, min_samples_leaf=10, random_state=42)),
+        ("HistGBM", HistGradientBoostingClassifier(
+            max_iter=400, max_depth=7, learning_rate=0.2,
+            min_samples_leaf=20, random_state=42)),
     ]
 
 
-def train_and_evaluate(df: pd.DataFrame) -> dict:
-    """Leave-one-site-out CV with model sweep.
+def _run_loso_sweep(df: pd.DataFrame, label_col: str, label_name: str) -> dict:
+    """Run LOSO CV model sweep for a given label column.
 
-    For each model, runs LOSO CV across all sites, collecting per-site
-    accuracy and F1. Prints a comparison table and detailed results for
-    the best model.
+    Returns dict with best model name, full-trained model, and metrics.
     """
     from sklearn.metrics import (
         accuracy_score, precision_score, recall_score, f1_score,
         classification_report,
     )
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.base import clone
 
-    sites = sorted(df["site"].unique())
+    all_sites = sorted(df["site"].unique())
+    # Only test on Kalshi sites, training-only sites always stay in training set
+    test_sites = sorted(s for s in all_sites if s in ALL_SITES)
+    train_only_sites = sorted(s for s in all_sites if s not in ALL_SITES)
     models = _build_models()
 
     print(f"\n{'=' * 70}")
-    print(f"  LEAVE-ONE-SITE-OUT CV — MODEL SWEEP ({len(sites)} sites)")
+    print(f"  LEAVE-ONE-SITE-OUT CV — {label_name}")
+    print(f"  Test sites: {len(test_sites)} (Kalshi)  |  Train-only: {len(train_only_sites)}")
+    print(f"  Test data: 2026-01-01 onward")
     print(f"{'=' * 70}")
 
-    # Majority-class baseline
-    pos_rate = df[LABEL].mean()
+    pos_rate = df[label_col].mean()
     baseline_acc = max(pos_rate, 1 - pos_rate)
     baseline_label = "always-0" if pos_rate < 0.5 else "always-1"
+    n_pos = int((df[label_col] == 1).sum())
+    n_neg = len(df) - n_pos
+    print(f"  Class balance: {n_pos} positive ({n_pos / len(df):.1%}), "
+          f"{n_neg} negative ({n_neg / len(df):.1%})")
     print(f"  Baseline ({baseline_label}): {baseline_acc:.1%}\n")
 
-    # Store per-model LOSO results
     model_results = {}
 
     for model_name, model_template in models:
-        needs_scaling = model_name == "LogisticRegression"
         all_y_true = []
         all_y_pred = []
         all_y_prob = []
         all_sites_list = []
         per_site = []
 
-        for test_site in sites:
-            train_df = df[df["site"] != test_site]
-            test_df = df[df["site"] == test_site]
+        for test_site in test_sites:
+            # Train: all other sites (including train-only) + test site's pre-2026 data
+            test_mask = (df["site"] == test_site) & (df["date"] >= "2026-01-01")
+            train_df = df[~test_mask]
+            test_df = df[test_mask]
             if len(test_df) < 10:
                 continue
 
-            X_train = train_df[FEATURE_COLS].values.copy()
-            y_train = train_df[LABEL].values
-            X_test = test_df[FEATURE_COLS].values.copy()
-            y_test = test_df[LABEL].values
+            X_train = train_df[FEATURE_COLS].values
+            y_train = train_df[label_col].values
+            X_test = test_df[FEATURE_COLS].values
+            y_test = test_df[label_col].values
 
-            if needs_scaling:
-                scaler = StandardScaler()
-                X_train = scaler.fit_transform(X_train)
-                X_test = scaler.transform(X_test)
-
-            # Clone model for each fold
-            from sklearn.base import clone
             model = clone(model_template)
             model.fit(X_train, y_train)
             y_pred = model.predict(X_test)
@@ -880,7 +981,6 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
     best_f1 = -1.0
     for name in [n for n, _ in models]:
         r = model_results[name]
-        tag = ""
         if r["f1"] > best_f1:
             best_f1 = r["f1"]
             best_name = name
@@ -893,11 +993,11 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
     best = model_results[best_name]
 
     print(f"\n{'=' * 70}")
-    print(f"  {best_name} — DETAILED RESULTS")
+    print(f"  {best_name} — DETAILED RESULTS ({label_name})")
     print(f"{'=' * 70}")
     print(classification_report(
         best["y_true"], best["y_pred"],
-        target_names=["no_increase_f", "will_increase_f"]))
+        target_names=[f"no_{label_name}", label_name]))
 
     # Per-site breakdown
     print(f"  PER-SITE ACCURACY")
@@ -913,21 +1013,72 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
     print(f"  Mean F1:       {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
 
     # Feature importances — train best model on full data
-    from sklearn.base import clone
-    full_model = clone(model_results[best_name].get("_template", _build_models()[0][1]))
-    # Find the template
     for name, tmpl in _build_models():
         if name == best_name:
             full_model = clone(tmpl)
             break
     X_all = df[FEATURE_COLS].values
-    y_all = df[LABEL].values
+    y_all = df[label_col].values
     full_model.fit(X_all, y_all)
     if hasattr(full_model, "feature_importances_"):
         _print_feature_importances(full_model, FEATURE_COLS)
 
     # Calibration
     _print_calibration(best["y_true"], best["y_prob"])
+
+    # SHAP plots
+    try:
+        import shap
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from paths import project_path
+
+        chart_dir = project_path("charts", "peak")
+        os.makedirs(chart_dir, exist_ok=True)
+        safe_label = label_name.replace("°", "").replace(">", "gt")
+
+        explainer = shap.TreeExplainer(full_model)
+        X_df = pd.DataFrame(X_all, columns=FEATURE_COLS)
+        shap_values = explainer(X_df)
+
+        # Summary dot plot
+        plt.figure(figsize=(10, 8))
+        shap.summary_plot(shap_values.values, X_df, max_display=20, show=False)
+        plt.title(f"SHAP — {label_name}")
+        plt.tight_layout()
+        path = os.path.join(chart_dir, f"shap_peak_{safe_label}.png")
+        plt.savefig(path, dpi=150)
+        plt.close()
+        print(f"  Saved {path}")
+
+        # Bar plot (mean |SHAP|)
+        plt.figure(figsize=(10, 8))
+        shap.summary_plot(shap_values.values, X_df, max_display=20, show=False, plot_type="bar")
+        plt.title(f"SHAP bar — {label_name}")
+        plt.tight_layout()
+        path = os.path.join(chart_dir, f"shap_peak_{safe_label}_bar.png")
+        plt.savefig(path, dpi=150)
+        plt.close()
+        print(f"  Saved {path}")
+
+        # Per-feature dependence plots (top 15 by mean |SHAP|)
+        mean_abs_shap = np.mean(np.abs(shap_values.values), axis=0)
+        top_idx = np.argsort(mean_abs_shap)[::-1][:15]
+        feat_dir = os.path.join(chart_dir, f"shap_peak_{safe_label}_features")
+        os.makedirs(feat_dir, exist_ok=True)
+        for rank, fi in enumerate(top_idx):
+            feat_name = FEATURE_COLS[fi]
+            plt.figure(figsize=(8, 5))
+            shap.dependence_plot(feat_name, shap_values.values, X_df, show=False)
+            plt.title(f"SHAP — {feat_name} ({label_name})")
+            plt.tight_layout()
+            fpath = os.path.join(feat_dir, f"{rank:02d}_{feat_name}.png")
+            plt.savefig(fpath, dpi=120)
+            plt.close()
+        print(f"  Saved {len(top_idx)} per-feature plots to {feat_dir}")
+    except Exception as e:
+        print(f"  SHAP plots failed: {e}")
 
     return {
         "model_name": best_name,
@@ -939,6 +1090,36 @@ def train_and_evaluate(df: pd.DataFrame) -> dict:
             "accuracy": v["accuracy"], "f1": v["f1"],
             "precision": v["precision"], "recall": v["recall"],
         } for k, v in model_results.items()},
+    }
+
+
+def train_and_evaluate(df: pd.DataFrame) -> dict:
+    """Leave-one-site-out CV for >=0°F, >1°F and >2°F labels."""
+
+    # >=0°F (will not decrease)
+    LABEL_0 = "will_not_decrease"
+    result_0f = None
+    if LABEL_0 in df.columns:
+        result_0f = _run_loso_sweep(df, LABEL_0, ">=0°F")
+
+    # >1°F
+    result_1f = _run_loso_sweep(df, LABEL, ">1°F")
+
+    # >2°F
+    LABEL_2 = "will_increase_2f"
+    result_2f = None
+    if LABEL_2 in df.columns:
+        result_2f = _run_loso_sweep(df, LABEL_2, ">2°F")
+
+    return {
+        "model_name": result_1f["model_name"],
+        "model": result_1f["model"],
+        "accuracy": result_1f["accuracy"],
+        "f1": result_1f["f1"],
+        "per_site": result_1f["per_site"],
+        "all_results": result_1f["all_results"],
+        "result_0f": result_0f,
+        "result_2f": result_2f,
     }
 
 
@@ -1038,6 +1219,56 @@ def _plot_feature_distributions(df: pd.DataFrame) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def tune_histgbm(df: pd.DataFrame) -> None:
+    """Grid search HistGBM hyperparameters using StratifiedKFold."""
+    from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.model_selection import GridSearchCV, StratifiedKFold
+
+    X = df[FEATURE_COLS].values
+    y = df[LABEL].values
+    n = len(df)
+
+    param_grid = {
+        "max_iter": [100, 200, 400],
+        "max_depth": [3, 4, 5, 7],
+        "learning_rate": [0.05, 0.1, 0.2],
+        "min_samples_leaf": [5, 10, 20],
+    }
+
+    n_combos = 1
+    for v in param_grid.values():
+        n_combos *= len(v)
+
+    print(f"\n{'=' * 78}")
+    print(f"  HISTGBM HYPERPARAMETER TUNING ({n} rows, {len(FEATURE_COLS)} features)")
+    print(f"{'=' * 78}")
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    gs = GridSearchCV(
+        HistGradientBoostingClassifier(random_state=42, early_stopping=True,
+                                       n_iter_no_change=10),
+        param_grid, cv=cv, scoring="f1", n_jobs=-1, verbose=1,
+    )
+    gs.fit(X, y)
+
+    print(f"\n  Best params: {gs.best_params_}")
+    print(f"  Best CV F1: {gs.best_score_:.4f}")
+
+    results_df = pd.DataFrame(gs.cv_results_).sort_values("rank_test_score")
+    print(f"\n  Top 10 configurations:")
+    print(f"  {'Rank':>4s} {'F1':>9s} {'max_iter':>9s} {'depth':>5s}"
+          f" {'lr':>6s} {'min_leaf':>8s}")
+    print(f"  {'----':>4s} {'-'*9} {'-'*9} {'-'*5} {'-'*6} {'-'*8}")
+    for _, row in results_df.head(10).iterrows():
+        print(f"  {int(row['rank_test_score']):>4d}"
+              f" {row['mean_test_score']:>9.4f}"
+              f" {int(row['param_max_iter']):>9d}"
+              f" {int(row['param_max_depth']):>5d}"
+              f" {row['param_learning_rate']:>6.2f}"
+              f" {int(row['param_min_samples_leaf']):>8d}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Peak detection backtest")
     parser.add_argument("--site", type=str, default=None,
@@ -1046,9 +1277,17 @@ def main() -> None:
                         help="Persist trained model to disk")
     parser.add_argument("--plot-features", action="store_true",
                         help="Plot feature distributions per class label")
+    parser.add_argument("--use-all-sites", action="store_true",
+                        help="Include all training sites (default: Kalshi sites only)")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Only use data from this date (YYYY-MM-DD)")
+    parser.add_argument("--tune", action="store_true",
+                        help="Grid search HistGBM hyperparameters")
     args = parser.parse_args()
 
     sites = args.site.split(",") if args.site else None
+    if sites is None and args.use_all_sites:
+        sites = list(ALL_SITES_WITH_TRAINING)
 
     print("=" * 70)
     print("  PEAK DETECTION BACKTEST")
@@ -1060,7 +1299,7 @@ def main() -> None:
     print()
 
     print("Loading and generating samples...")
-    df = load_all_samples(sites)
+    df = load_all_samples(sites, since=args.since)
     if df.empty:
         print("No samples generated. Check data files.")
         sys.exit(1)
@@ -1075,6 +1314,10 @@ def main() -> None:
 
     if args.plot_features:
         _plot_feature_distributions(df)
+        return
+
+    if args.tune:
+        tune_histgbm(df)
         return
 
     results = train_and_evaluate(df)

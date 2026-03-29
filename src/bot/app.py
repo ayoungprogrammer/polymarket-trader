@@ -847,7 +847,7 @@ def _update_momentum_chart(
     try:
         from weather.prediction import plot_momentum
         from weather.forecast import STATIONS as FORECAST_STATIONS
-        from weather.observations import fetch_sun_times
+        from weather.observations import fetch_sun_times, fetch_all_cli_today, fetch_dsm_today
         import gc
 
         site_cross = SITE_MOMENTUM_PARAMS.get(site, (MOMENTUM_PARAMS_FAST[0],))[0]
@@ -864,21 +864,84 @@ def _update_momentum_chart(
 
         # 6h METAR max — only use records from today (station timezone)
         metar_6h_f = None
+        metar_6h_readings = []
+        auto_max_since_last_metar_f = None
+        _site_tz_str = coords[2] if coords else None
         if "max_temp_6h_f" in mom_df.columns:
             _today_df = mom_df
             if coords and "timestamp" in mom_df.columns:
                 _stz = ZoneInfo(coords[2])
                 _today_local = datetime.now(_stz).date()
-                _ts_parsed = pd.to_datetime(mom_df["timestamp"].str[:19])
-                _today_df = mom_df[_ts_parsed.dt.tz_localize("UTC").dt.tz_convert(_stz).dt.date == _today_local]
+                # Timestamps are local with offset (e.g. "2026-03-27T13:52:00-0400")
+                # Parse with offset intact, not as UTC
+                _ts_parsed = pd.to_datetime(mom_df["timestamp"], utc=True)
+                _today_df = mom_df[_ts_parsed.dt.tz_convert(_stz).dt.date == _today_local]
             m6h = _today_df["max_temp_6h_f"].dropna()
             if not m6h.empty:
                 metar_6h_f = float(m6h.max())
+                # Build multi-METAR readings list
+                _metar_rows = _today_df[_today_df["max_temp_6h_f"].notna()]
+                for _, _mr in _metar_rows.iterrows():
+                    metar_6h_readings.append({
+                        "timestamp_utc": str(_mr["timestamp"]),
+                        "value_f": float(_mr["max_temp_6h_f"]),
+                    })
+                # Auto max since last METAR (auto-obs only, exclude METAR T-group)
+                if metar_6h_readings and "timestamp" in _today_df.columns and "temperature_c" in _today_df.columns:
+                    _last_metar_ts = metar_6h_readings[-1]["timestamp_utc"]
+                    _after = _today_df[_today_df["timestamp"] > _last_metar_ts]
+                    _after_tc = pd.to_numeric(_after["temperature_c"], errors="coerce")
+                    # Auto readings are whole-degree C (fractional = METAR T-group)
+                    _auto_mask = (_after_tc % 1 == 0) & _after_tc.notna()
+                    if _auto_mask.any():
+                        _auto_max_c = int(round(_after_tc[_auto_mask].max()))
+                        auto_max_since_last_metar_f = round(_auto_max_c * 9.0 / 5.0 + 32.0)
+
+        # Extract forecast peak hour
+        _forecast_peak_hour = None
+        if forecast_df is not None and not forecast_df.empty and "temperature_f" in forecast_df.columns:
+            _fpeak_idx = forecast_df["temperature_f"].idxmax()
+            _fpeak_ts = pd.to_datetime(forecast_df.loc[_fpeak_idx, "timestamp"])
+            if _site_tz_str:
+                _fpeak_local = _fpeak_ts.tz_convert(ZoneInfo(_site_tz_str)) if _fpeak_ts.tzinfo else _fpeak_ts.tz_localize("UTC").tz_convert(ZoneInfo(_site_tz_str))
+                _forecast_peak_hour = _fpeak_local.hour + _fpeak_local.minute / 60.0
+
+        # CLI reports — fetch all today's CLIs (preliminary + final)
+        cli_reports = []
+        _cli_high_f = None
+        try:
+            all_cli = fetch_all_cli_today(site, max_versions=5)
+            if all_cli and coords:
+                _today_str = " ".join(
+                    datetime.now(station_tz).strftime("%B %-d %Y").upper().split()
+                )
+                cli_reports = [
+                    r for r in all_cli
+                    if " ".join((r.get("date") or "").split()) == _today_str
+                ]
+                if cli_reports:
+                    _cli_high_f = cli_reports[0].get("max_temp_f")
+        except Exception as e:
+            log.debug(f"[{site}] CLI fetch failed: {e}")
+
+        # DSM reports — fetch from IEM AFOS archive
+        dsm_reports = []
+        try:
+            dsm_reports = fetch_dsm_today(site, station_tz=_site_tz_str)
+            if dsm_reports:
+                _dsm_max = max(r["max_temp_f"] for r in dsm_reports if r.get("max_temp_f"))
+                if _dsm_max:
+                    # Use the higher of CLI and DSM — both are valid floors
+                    _cli_high_f = max(_cli_high_f, _dsm_max) if _cli_high_f is not None else _dsm_max
+        except Exception as e:
+            log.debug(f"[{site}] DSM fetch failed: {e}")
 
         # Bracket model
         bracket = None
         bracket_probs = None
         bracket_error = None
+        naive_f = None
+        bracket_max_c = None
         try:
             from weather.bracket_model import load_model, get_probability
             from weather.backtest_rounding import extract_regression_features
@@ -892,6 +955,7 @@ def _update_momentum_chart(
                 max_c = feats.get("max_c")
                 if max_c is not None:
                     naive_f = round(float(max_c) * 9.0 / 5.0 + 32.0)
+                    bracket_max_c = max_c
 
                     # Fetch real Kalshi market brackets via market.py
                     brackets_parsed = []
@@ -905,7 +969,7 @@ def _update_momentum_chart(
                     except Exception as e:
                         log.warning(f"[{site}] Could not fetch market brackets: {e}", exc_info=True)
 
-                    # Fallback: synthesize even-odd brackets
+                    # Fallback: synthesize even-odd brackets if no API brackets
                     if not brackets_parsed:
                         if naive_f % 2 == 0:
                             center_lo = naive_f
@@ -913,8 +977,15 @@ def _update_momentum_chart(
                             center_lo = naive_f - 1
                         brackets_parsed = [(lo, lo + 1) for lo in [center_lo - 2, center_lo, center_lo + 2]]
 
-                    bracket_probs = get_probability(bmodel, feats, brackets_parsed,
-                                                    metar_6h_f=metar_6h_f)
+                    bracket_probs = get_probability(
+                        bmodel, feats, brackets_parsed,
+                        metar_6h_f=metar_6h_f,
+                        metar_6h_readings=metar_6h_readings if metar_6h_readings else None,
+                        site_timezone=_site_tz_str,
+                        auto_max_since_last_metar_f=auto_max_since_last_metar_f,
+                        forecast_peak_hour=_forecast_peak_hour,
+                        cli_high_f=_cli_high_f,
+                    )
                     bracket_probs.sort(key=lambda x: -x["prob"])
                     if bracket_probs:
                         top = bracket_probs[0]
@@ -931,28 +1002,37 @@ def _update_momentum_chart(
             peak_bundle = load_peak_model()
             _fcst_high = forecast_df["temperature_f"].max() if forecast_df is not None and not forecast_df.empty else 70.0
             _sn = sun_times.get("solar_noon", 12.0) if sun_times else 12.0
+
+            # Fetch yesterday's summary from the obs data
+            _yesterday = None
+            try:
+                if mom_df is not None and "temperature_f" in mom_df.columns and "timestamp" in mom_df.columns:
+                    _ts = pd.to_datetime(mom_df["timestamp"].str[:19])
+                    _dates = _ts.dt.date
+                    _today = _dates.max()
+                    _yest_mask = _dates < _today
+                    if _yest_mask.any():
+                        _ydf = mom_df[_yest_mask]
+                        _ytemps = pd.to_numeric(_ydf["temperature_f"], errors="coerce").dropna()
+                        if not _ytemps.empty:
+                            _yest_high = float(_ytemps.max())
+                            _yest_low = float(_ytemps.min())
+                            _yest_peak_idx = int(_ytemps.idxmax())
+                            _yest_peak_ts = pd.to_datetime(_ydf["timestamp"].str[:19]).iloc[_yest_peak_idx]
+                            _yest_peak_hour = _yest_peak_ts.hour + _yest_peak_ts.minute / 60.0
+                            _yesterday = {
+                                "high_f": _yest_high,
+                                "low_f": _yest_low,
+                                "peak_hour": _yest_peak_hour,
+                                "high_vs_forecast_f": _yest_high - float(_fcst_high),
+                            }
+            except Exception:
+                pass
+
             peak_result = peak_predict(peak_bundle, mom_df, forecast_high_f=float(_fcst_high),
-                                       solar_noon_hour=_sn)
+                                       solar_noon_hour=_sn, yesterday=_yesterday)
         except Exception as e:
             log.warning(f"[{site}] Peak model for chart: {e}", exc_info=True)
-
-        # METAR 6h report time — vertical line on chart
-        metar_6h_local_dt = None
-        try:
-            from weather.sites import get_site_config
-            site_cfg = get_site_config(site)
-            metar_utc_str = site_cfg.get("metar_6h_utc")
-            if metar_utc_str and coords:
-                station_tz = ZoneInfo(coords[2])
-                _today_local = datetime.now(station_tz).date()
-                hh, mm = int(metar_utc_str.split(":")[0]), int(metar_utc_str.split(":")[1])
-                metar_utc_dt = datetime(
-                    _today_local.year, _today_local.month, _today_local.day,
-                    hh, mm, tzinfo=ZoneInfo("UTC"),
-                )
-                metar_6h_local_dt = metar_utc_dt.astimezone(station_tz)
-        except Exception as e:
-            log.debug(f"[{site}] Could not compute METAR 6h time: {e}")
 
         plot_momentum(mom_df, site, output=chart_path,
                       forecast_df=forecast_df if forecast_df is not None and not forecast_df.empty else None,
@@ -965,11 +1045,18 @@ def _update_momentum_chart(
                       bracket_probs=bracket_probs,
                       bracket_error=bracket_error,
                       peak_result=peak_result,
-                      metar_6h_local_dt=metar_6h_local_dt)
+                      cli_reports=cli_reports,
+                      dsm_reports=dsm_reports)
         watch_state.update(site, chart_path=chart_path)
         gc.collect()
     except Exception as e:
         log.warning(f"[{site}] Could not update momentum chart: {e}")
+
+    return {
+        "bracket_probs": bracket_probs,
+        "naive_f": naive_f,
+        "max_c": bracket_max_c,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -986,13 +1073,15 @@ def _check_bracket_lock_notify(
     site: str,
     series_ticker: str,
     station_tz: "ZoneInfo",
+    bracket_probs: Optional[List[dict]] = None,
+    naive_f: Optional[int] = None,
+    max_c: Optional[float] = None,
 ) -> None:
     """Check if bracket model locks in at >95% and send Telegram if so.
 
-    Queries the bracket model for the current observations. If the top
-    bracket has >95% probability, fetches Kalshi orderbooks for brackets
-    below it and notifies if any have NO asks > 10c (i.e. opportunities
-    to sell YES / buy NO on brackets the model says won't hit).
+    Uses pre-computed bracket_probs from the poller (avoids re-fetching obs
+    and re-running the model).  Fetches Kalshi orderbooks via market.py for
+    brackets below the locked bracket to find mispriced opportunities.
     """
     today_str = datetime.now(station_tz).strftime("%Y-%m-%d")
     with _bracket_lock_notified_lock:
@@ -1001,98 +1090,35 @@ def _check_bracket_lock_notify(
 
     tag = f"[{site}]"
     try:
-        from weather.bracket_model import load_model as load_bracket_model, get_probability
-        from weather.backtest_rounding import extract_regression_features
-        from weather.observations import SynopticIngestion, fetch_sun_times
-        from weather.forecast import STATIONS as FORECAST_STATIONS
-
-        # Fetch live obs
-        si = SynopticIngestion(site)
-        obs_df = si.fetch_live_weather(hours=24)
-        if obs_df.empty or len(obs_df) < 20:
+        if not bracket_probs or naive_f is None:
+            log.debug(f"{tag} Bracket lock: no bracket_probs or naive_f")
             return
 
-        # Sun times for solar noon
-        coords = FORECAST_STATIONS.get(site)
-        solar_noon_hour = None
-        if coords:
-            sun = fetch_sun_times(coords[0], coords[1], today_str)
-            if sun:
-                solar_noon_hour = sun.get("solar_noon")
-
-        # Extract features + run bracket model
-        bmodel = load_bracket_model()
-        feats = extract_regression_features(obs_df, solar_noon_hour=solar_noon_hour)
-        if feats is None:
-            return
-
-        max_c = feats.get("max_c")
-        if max_c is None:
-            return
-        naive_f = round(float(max_c) * 9.0 / 5.0 + 32.0)
-
-        # 6h METAR lock-in — only use records from today
-        metar_6h_f = None
-        if "max_temp_6h_f" in obs_df.columns:
-            _ts_p = pd.to_datetime(obs_df["timestamp"].str[:19])
-            _today_obs = obs_df[_ts_p.dt.tz_localize("UTC").dt.tz_convert(station_tz).dt.date == datetime.now(station_tz).date()]
-            m6h = _today_obs["max_temp_6h_f"].dropna()
-            if not m6h.empty:
-                metar_6h_f = float(m6h.max())
-
-        # Fetch all today's Kalshi brackets
-        client = _get_client()
-        today_suffix = datetime.now(station_tz).strftime("%y%b%d").upper()
-        resp = client.get_markets(series_ticker)
-        today_markets = [m for m in resp.get("markets", [])
-                         if today_suffix in m.get("ticker", "")]
-        if not today_markets:
-            return
-
-        all_brackets = parse_all_brackets(today_markets)
-        bracket_tuples = [(lo, hi) for _, lo, hi in all_brackets]
-
-        bracket_probs = get_probability(bmodel, feats, bracket_tuples,
-                                        metar_6h_f=metar_6h_f)
-        if not bracket_probs:
-            return
-
-        bracket_probs.sort(key=lambda x: -x["prob"])
-        top = bracket_probs[0]
+        sorted_probs = sorted(bracket_probs, key=lambda x: -x["prob"])
+        top = sorted_probs[0]
         top_prob = top["prob"]
         top_lo, top_hi = top["bracket"]
 
-        if top_prob < 0.95:
+        # Use S2 prob if available, otherwise Final
+        top_s2 = top.get("stage2_prob", top_prob)
+        log.info(f"{tag} Bracket lock check: top=[{top_lo},{top_hi}] @ {top_prob:.1%} (S2={top_s2:.1%})")
+
+        # Lower threshold for S2 model confidence (no METAR/clamp needed)
+        threshold = 0.80 if top_s2 >= 0.80 else 0.95
+        if top_prob < threshold:
             return
 
-        # Model locked in at >95% — check brackets below for NO opportunities
-        # Build ticker lookup: (lo, hi) -> ticker
-        ticker_by_bracket = {(lo, hi): tk for tk, lo, hi in all_brackets}
+        # Fetch live prices for all brackets below the locked one
+        from weather.market import get_today_brackets
+        client = _get_client()
+        all_brackets = get_today_brackets(client, site, "high", include_prices=True)
+        if not all_brackets:
+            return
 
         opportunities = []
-        for tk, lo, hi in all_brackets:
-            if hi <= top_lo:  # bracket is strictly below predicted
-                try:
-                    ob = client.get_orderbook(tk)
-                    yes_bids = ob.get("yes", [])
-                    no_bids = ob.get("no", [])
-                    # NO ask = price to buy NO = 100 - best_yes_bid
-                    # YES ask = price to buy YES = 100 - best_no_bid
-                    best_yes_bid = yes_bids[-1][0] if yes_bids else 0
-                    yes_ask = (100 - no_bids[-1][0]) if no_bids else None
-                    no_ask = (100 - best_yes_bid) if best_yes_bid > 0 else None
-                    # We want brackets where YES still has asks > 10c
-                    # (market hasn't fully priced out this bracket yet)
-                    if yes_ask is not None and yes_ask > 10:
-                        opportunities.append({
-                            "ticker": tk,
-                            "bracket": (lo, hi),
-                            "yes_ask": yes_ask,
-                            "yes_bid": best_yes_bid,
-                            "no_ask": no_ask,
-                        })
-                except Exception:
-                    pass
+        for b in all_brackets:
+            if b["hi"] <= top_lo and b["yes_ask"] > 10:
+                opportunities.append(b)
 
         if not opportunities:
             return
@@ -1107,9 +1133,8 @@ def _check_bracket_lock_notify(
             "<b>Brackets below with YES ask &gt; 10c:</b>",
         ]
         for opp in sorted(opportunities, key=lambda x: -x["yes_ask"]):
-            lo, hi = opp["bracket"]
             lines.append(
-                f"  [{lo}, {hi}]°F — YES ask: {opp['yes_ask']}c"
+                f"  [{opp['lo']}, {opp['hi']}]°F — YES ask: {opp['yes_ask']}c"
                 f" | bid: {opp['yes_bid']}c"
                 f"  <code>{opp['ticker']}</code>"
             )
@@ -1637,9 +1662,12 @@ def _watch_loop(
                                        observed_max_f=obs_max, forecast_peak_f=fcst_peak,
                                        forecast_peak_time=_forecast_peak_time_iso(fcst_df, station_tz.key),
                                        momentum_rate=ma_cross)
-                    _update_momentum_chart(site, mom_df, fcst_df, series_ticker=series_ticker)
-                    if series_ticker:
-                        _check_bracket_lock_notify(site, series_ticker, station_tz)
+                    _chart_data = _update_momentum_chart(site, mom_df, fcst_df, series_ticker=series_ticker)
+                    if series_ticker and _chart_data:
+                        _check_bracket_lock_notify(site, series_ticker, station_tz,
+                                                   bracket_probs=_chart_data.get("bracket_probs"),
+                                                   naive_f=_chart_data.get("naive_f"),
+                                                   max_c=_chart_data.get("max_c"))
                     if status == "TOO_LATE":
                         log.info(f"{tag} Past peak window — done for today")
                         too_late = True
@@ -1660,8 +1688,8 @@ def _watch_loop(
                         return obs_max
 
                 elif strategy == "claude":
-                    # Gate: run momentum first (free) — only call Claude when
-                    # conditions look ready, to avoid wasting API credits.
+                    # DISABLED: Claude strategy bets too late.
+                    # Uses momentum polling + bracket lock only.
                     mom_status, obs_max, fcst_peak, ma_cross, mom_df, fcst_df = momentum_strategy(site)
                     log.info(f"{tag} momentum gate: {mom_status} | "
                              f"ma_cross={ma_cross:+.2f}°F | obs_max={obs_max:.1f}°F | "
@@ -1670,38 +1698,41 @@ def _watch_loop(
                                        observed_max_f=obs_max, forecast_peak_f=fcst_peak,
                                        forecast_peak_time=_forecast_peak_time_iso(fcst_df, station_tz.key),
                                        momentum_rate=ma_cross)
-                    _update_momentum_chart(site, mom_df, fcst_df, series_ticker=series_ticker)
-                    if series_ticker:
-                        _check_bracket_lock_notify(site, series_ticker, station_tz)
+                    _chart_data = _update_momentum_chart(site, mom_df, fcst_df, series_ticker=series_ticker)
+                    if series_ticker and _chart_data:
+                        _check_bracket_lock_notify(site, series_ticker, station_tz,
+                                                   bracket_probs=_chart_data.get("bracket_probs"),
+                                                   naive_f=_chart_data.get("naive_f"),
+                                                   max_c=_chart_data.get("max_c"))
 
                     if mom_status == "TOO_LATE":
                         log.info(f"{tag} Past peak window — done for today")
                         too_late = True
                         break
-                    elif mom_status in ("TOO_EARLY", "ERROR"):
-                        log.info(f"{tag} Momentum not ready — skipping Claude call")
-                    else:
-                        log.info(f"{tag} Momentum {mom_status} — calling Claude for decision")
-                        decision = run_strategy(
-                            market_type, label, series_ticker, site=site, client=client)
-                        if decision and decision.get('action') != 'no_bet':
-                            b = decision.get('bracket', [])
-                            b_str = f"[{b[0]}, {b[1]}]" if len(b) == 2 else "?"
-                            log.info(f"{tag} Claude says BET: "
-                                     f"bracket {b_str}°F, "
-                                     f"confidence {decision.get('confidence')}")
-                            watch_state.update(site, state="locked",
-                                               message=f"Claude BET: {b_str}°F")
-                            _send_telegram(
-                                f"<b>{tag} Claude says BET</b>\n"
-                                f"Bracket: {b_str}°F | Confidence: {decision.get('confidence')}\n"
-                                f"Reasoning: {decision.get('reasoning', '')[:300]}\n"
-                                f"Poll #{iteration} | {mins_left:.0f} min to close\n"
-                                f"<a href=\"{_kalshi_url(series_ticker)}\">View on Kalshi</a>",
-                                image_path=project_path("charts", "weather", f"momentum_{site}.png"),
-                            )
-                            return decision
-                        log.info(f"{tag} Claude says no_bet")
+                    # elif mom_status in ("TOO_EARLY", "ERROR"):
+                    #     log.info(f"{tag} Momentum not ready — skipping Claude call")
+                    # else:
+                    #     log.info(f"{tag} Momentum {mom_status} — calling Claude for decision")
+                    #     decision = run_strategy(
+                    #         market_type, label, series_ticker, site=site, client=client)
+                    #     if decision and decision.get('action') != 'no_bet':
+                    #         b = decision.get('bracket', [])
+                    #         b_str = f"[{b[0]}, {b[1]}]" if len(b) == 2 else "?"
+                    #         log.info(f"{tag} Claude says BET: "
+                    #                  f"bracket {b_str}°F, "
+                    #                  f"confidence {decision.get('confidence')}")
+                    #         watch_state.update(site, state="locked",
+                    #                            message=f"Claude BET: {b_str}°F")
+                    #         _send_telegram(
+                    #             f"<b>{tag} Claude says BET</b>\n"
+                    #             f"Bracket: {b_str}°F | Confidence: {decision.get('confidence')}\n"
+                    #             f"Reasoning: {decision.get('reasoning', '')[:300]}\n"
+                    #             f"Poll #{iteration} | {mins_left:.0f} min to close\n"
+                    #             f"<a href=\"{_kalshi_url(series_ticker)}\">View on Kalshi</a>",
+                    #             image_path=project_path("charts", "weather", f"momentum_{site}.png"),
+                    #         )
+                    #         return decision
+                    #     log.info(f"{tag} Claude says no_bet")
 
                 elif strategy == "metar6h":
                     try:
@@ -1738,13 +1769,17 @@ def _watch_loop(
 
             # Update momentum chart for dashboard (all strategies)
             if strategy not in ("momentum", "claude"):
+                _chart_data = None
                 try:
                     _, _, _, _, _mom_df, _fcst_df = momentum_strategy(site)
-                    _update_momentum_chart(site, _mom_df, _fcst_df, series_ticker=series_ticker)
+                    _chart_data = _update_momentum_chart(site, _mom_df, _fcst_df, series_ticker=series_ticker)
                 except Exception as e:
                     log.debug(f"{tag} Could not update momentum chart: {e}")
-                if series_ticker:
-                    _check_bracket_lock_notify(site, series_ticker, station_tz)
+                if series_ticker and _chart_data:
+                    _check_bracket_lock_notify(site, series_ticker, station_tz,
+                                               bracket_probs=_chart_data.get("bracket_probs"),
+                                               naive_f=_chart_data.get("naive_f"),
+                                               max_c=_chart_data.get("max_c"))
 
             # Update settlement prediction for dashboard
             if obs_max > 0:
@@ -2172,10 +2207,12 @@ def site_page(site):
     except Exception as e:
         log.debug(f"[{site}] Could not generate chart: {e}")
 
+    cli_suffix = site.upper().lstrip("K")
     html = (_load_template("site.html")
             .replace("{{SITE}}", site)
             .replace("{{CITY}}", city)
-            .replace("{{KALSHI_URL}}", kalshi_url))
+            .replace("{{KALSHI_URL}}", kalshi_url)
+            .replace("{{CLI_SUFFIX}}", cli_suffix))
     return Response(html, content_type="text/html")
 
 
@@ -2331,6 +2368,85 @@ def api_analysis_chart(name):
 
 
 # ---------------------------------------------------------------------------
+# Backtest routes
+# ---------------------------------------------------------------------------
+
+@app.route("/backtest")
+def backtest_page():
+    return Response(_load_template("backtest.html"), content_type="text/html")
+
+
+@app.route("/api/backtest/chart")
+def api_backtest_chart():
+    """Generate a historical momentum chart for a given site/date/time."""
+    site = flask_request.args.get("site", "KLAX").upper()
+    date_str = flask_request.args.get("date")
+    cutoff_time = flask_request.args.get("time")  # optional HH:MM
+
+    if not date_str:
+        return jsonify({"error": "date parameter required (YYYY-MM-DD)"}), 400
+
+    try:
+        from weather.viz_day import render_day
+        output = str(project_path("charts", "weather",
+                                  f"backtest_{site}_{date_str}.png"))
+        render_day(site, date_str, output=output,
+                   cutoff_time=cutoff_time if cutoff_time else None)
+        return send_file(output, mimetype="image/png")
+    except Exception as e:
+        log.warning(f"Backtest chart error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/backtest/info")
+def api_backtest_info():
+    """Return METAR 6h max info for a given site/date."""
+    site = flask_request.args.get("site", "KLAX").upper()
+    date_str = flask_request.args.get("date")
+    if not date_str:
+        return jsonify({"error": "date parameter required"}), 400
+
+    try:
+        from weather.backtest import load_site_history
+        df = load_site_history(site)
+        day_df = df[df["date"].astype(str) == date_str].copy()
+        if day_df.empty:
+            return jsonify({"error": f"No data for {site} on {date_str}"}), 404
+
+        day_df = day_df.sort_values("ts").reset_index(drop=True)
+        result = {"site": site, "date": date_str}
+
+        # All 6h METAR readings (skip before 01:00)
+        if "max_temp_6h_f" in day_df.columns:
+            m6h = day_df[day_df["max_temp_6h_f"].notna() & (day_df["ts"].dt.hour >= 1)]
+            if not m6h.empty:
+                m6h_vals = pd.to_numeric(m6h["max_temp_6h_f"], errors="coerce")
+                max_idx = m6h_vals.idxmax()
+                max_val = float(m6h_vals.loc[max_idx])
+                max_ts = str(m6h.loc[max_idx, "timestamp"])
+                result["metar_6h_max_f"] = max_val
+                result["metar_6h_max_time"] = max_ts
+                result["settlement_f"] = round(max_val)
+                # All readings
+                readings = []
+                for _, r in m6h.iterrows():
+                    readings.append({
+                        "time": str(r["timestamp"]),
+                        "value_f": float(r["max_temp_6h_f"]),
+                    })
+                result["metar_6h_readings"] = readings
+
+        # Auto obs max
+        if "temperature_f" in day_df.columns:
+            auto_max = float(day_df["temperature_f"].max())
+            result["auto_max_f"] = auto_max
+
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# ---------------------------------------------------------------------------
 # NBA routes
 # ---------------------------------------------------------------------------
 
@@ -2344,9 +2460,11 @@ def api_nba_live():
     """Live games with quarter scores + projections."""
     try:
         from nba.data import get_live_scoreboard, build_team_quarter_profiles, build_team_quarter_profiles_ha
+        from nba.markets import discover_nba_series, get_game_markets, parse_market_line
         from nba.strategy import (project_game_total, project_spread,
                                   project_halftime_total, filter_halftime_bet,
-                                  _total_to_probability, MAX_PACE_DEVIATION, MIN_PROFILE_GAMES)
+                                  _total_to_probability, _title_matches_game,
+                                  MAX_PACE_DEVIATION, MIN_PROFILE_GAMES)
     except ImportError as e:
         return jsonify({"error": f"nba modules not available: {e}"}), 500
 
@@ -2365,6 +2483,19 @@ def api_nba_live():
         profiles_ha = build_team_quarter_profiles_ha()
     except Exception:
         profiles_ha = {}
+
+    # Fetch all open Kalshi NBA markets once for bracket matching
+    all_nba_markets: List[dict] = []
+    try:
+        client = _get_client()
+        series = discover_nba_series(client)
+        for sticker in series:
+            try:
+                all_nba_markets.extend(get_game_markets(client, sticker, status="open"))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     enriched = []
     live_count = 0
@@ -2414,6 +2545,53 @@ def api_nba_live():
                         "not_overtime": not_ot,
                         "reason": "; ".join(reasons) if reasons else "all filters pass",
                     }
+
+            # Match Kalshi brackets to this game
+            if all_nba_markets and g.get("halftime_projection"):
+                home = g["home_team"]
+                away = g["away_team"]
+                proj = g["halftime_projection"]["projected_total"]
+                std = g["halftime_projection"]["calibrated_std"]
+                brackets = []
+                for mkt in all_nba_markets:
+                    parsed = parse_market_line(mkt)
+                    if not parsed:
+                        continue
+                    if parsed.get("side") not in ("over", "under") or parsed.get("player"):
+                        continue
+                    title = mkt.get("title", "") + " " + mkt.get("subtitle", "")
+                    if not _title_matches_game(title, home, away):
+                        continue
+                    line = parsed["line"]
+                    ticker = mkt.get("ticker", "")
+                    model_over = round(_total_to_probability(proj, line, std) * 100, 1)
+                    model_under = round(100 - model_over, 1)
+                    # Fetch Kalshi price from orderbook
+                    kalshi_cents = None
+                    try:
+                        book = client.get_orderbook(ticker)
+                        no_bids = book.get("no", [])
+                        yes_bids = book.get("yes", [])
+                        if no_bids:
+                            kalshi_cents = 100 - no_bids[-1][0]
+                        elif yes_bids:
+                            kalshi_cents = yes_bids[-1][0]
+                    except Exception:
+                        pass
+                    b = {
+                        "ticker": ticker,
+                        "side": parsed["side"],
+                        "line": line,
+                        "model_over": model_over,
+                        "model_under": model_under,
+                    }
+                    if kalshi_cents is not None:
+                        b["kalshi_cents"] = kalshi_cents
+                        model_prob = model_over if parsed["side"] == "over" else model_under
+                        b["edge"] = round(model_prob - kalshi_cents, 1)
+                    brackets.append(b)
+                brackets.sort(key=lambda b: b["line"])
+                g["kalshi_brackets"] = brackets
 
         enriched.append(g)
 

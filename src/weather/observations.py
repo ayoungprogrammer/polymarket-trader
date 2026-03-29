@@ -15,6 +15,10 @@ log = logging.getLogger(__name__)
 
 NWS_API_BASE = "https://api.weather.gov"
 NWS_CURRENT_URL = "https://tgftp.nws.noaa.gov/weather/current/{site}.html"
+NWS_CLI_URL = (
+    "https://forecast.weather.gov/product.php"
+    "?site=NWS&issuedby={suffix}&product=CLI&format=CI&version={version}&glossary=0"
+)
 SYNOPTIC_API_BASE = "https://api.synopticdata.com/v2"
 SYNOPTIC_TOKEN = "7c76618b66c74aee913bdbae4b448bdd"  # NWS public token
 
@@ -181,7 +185,6 @@ class SynopticIngestion:
     def fetch_live_weather(
         self,
         hours: int = 72,
-        units: str = "metric",
     ) -> pd.DataFrame:
         """Fetch recent observations and return as a DataFrame.
 
@@ -189,28 +192,25 @@ class SynopticIngestion:
         ----------
         hours : int
             Number of hours of recent data to fetch (max 720).
-        units : str
-            "english" for F/mph, "metric" for C/km/h.
 
         Returns
         -------
         pd.DataFrame
             One row per observation with all available sensor fields.
+            Temperatures are always in metric (°C source) with both _c
+            and _f columns derived.
         """
         recent_minutes = hours * 60
-        unit_str = "temp|F,speed|mph,english" if units == "english" else ""
         url = f"{SYNOPTIC_API_BASE}/stations/timeseries"
         params = {
             "STID": self.site,
             "showemptystations": "1",
-            "units": unit_str,
             "recent": recent_minutes,
             "complete": "1",
+            "units": "metric",
             "token": SYNOPTIC_TOKEN,
             "obtimezone": "local",
         }
-        if not unit_str:
-            del params["units"]
 
         log.info(f"Fetching Synoptic observations for {self.site} (last {hours}h)")
         resp = self.session.get(url, params=params, timeout=30)
@@ -228,27 +228,34 @@ class SynopticIngestion:
             return pd.DataFrame()
 
         obs = stations[0].get("OBSERVATIONS", {})
-        df = _synoptic_obs_to_df(obs, units)
+        df = _synoptic_obs_to_df(obs)
 
-        # Filter to current day using the local date in the timestamps
-        if not df.empty:
+        # Filter to current day only for short requests (<=24h)
+        if not df.empty and hours <= 24:
             today = df["timestamp"].iloc[-1][:10]
             df = df[df["timestamp"].str[:10] == today].reset_index(drop=True)
+
+        # Trim rows up to and including the 24h METAR if it occurs before 1 AM.
+        # The 24h METAR reports yesterday's max — same trim as load_site_history.
+        if not df.empty and "max_temp_24h_f" in df.columns:
+            ts = pd.to_datetime(df["timestamp"].str[:19])
+            early_24h = df[df["max_temp_24h_f"].notna() & (ts.dt.hour < 1)]
+            if not early_24h.empty:
+                first_pos = early_24h.index[0]
+                df = df.loc[df.index > first_pos].reset_index(drop=True)
 
         return df
 
 
-def _synoptic_obs_to_df(obs: dict, units: str) -> pd.DataFrame:
+def _synoptic_obs_to_df(obs: dict) -> pd.DataFrame:
     """Convert Synoptic OBSERVATIONS dict to a DataFrame.
 
-    Always produces both _c and _f columns for temperatures regardless
-    of the source unit system.
+    Source data is metric (°C, km/h). Always produces both _c and _f
+    columns for temperatures, and both _kmh and _mph for wind speed.
     """
     dates = obs.get("date_time", [])
     if not dates:
         return pd.DataFrame()
-
-    is_english = units == "english"
 
     # Map Synoptic field names to clean column names
     field_map = {
@@ -259,9 +266,9 @@ def _synoptic_obs_to_df(obs: dict, units: str) -> pd.DataFrame:
         "wind_speed_set_1": "wind_speed",
         "wind_direction_set_1": "wind_direction_deg",
         "wind_cardinal_direction_set_1d": "wind_cardinal",
-        "altimeter_set_1": "altimeter_inhg" if is_english else "altimeter",
+        "altimeter_set_1": "altimeter",
         "sea_level_pressure_set_1": "sea_level_pressure",
-        "visibility_set_1": "visibility_mi" if is_english else "visibility",
+        "visibility_set_1": "visibility",
         "cloud_layer_1_code_set_1": "cloud_layer_code",
         "cloud_layer_1_set_1d": "cloud_layer",
         "metar_set_1": "metar",
@@ -280,29 +287,21 @@ def _synoptic_obs_to_df(obs: dict, units: str) -> pd.DataFrame:
 
     df = pd.DataFrame(df_data)
 
-    # Add both C and F columns for all temperature fields
+    # Add both C and F columns for all temperature fields (source is metric)
     temp_cols = ["temperature", "dewpoint", "max_temp_6h", "min_temp_6h",
                  "max_temp_24h", "min_temp_24h"]
     for col in temp_cols:
         if col not in df.columns:
             continue
         numeric = pd.to_numeric(df[col], errors="coerce")
-        if is_english:
-            df[f"{col}_f"] = numeric
-            df[f"{col}_c"] = ((numeric - 32) * 5 / 9).round(2)
-        else:
-            df[f"{col}_c"] = numeric
-            df[f"{col}_f"] = (numeric * 9 / 5 + 32).round(2)
+        df[f"{col}_c"] = numeric
+        df[f"{col}_f"] = (numeric * 9 / 5 + 32).round(2)
         df.drop(columns=[col], inplace=True)
 
     if "wind_speed" in df.columns:
         numeric = pd.to_numeric(df["wind_speed"], errors="coerce")
-        if is_english:
-            df["wind_speed_mph"] = numeric
-            df["wind_speed_kmh"] = (numeric * 1.60934).round(2)
-        else:
-            df["wind_speed_kmh"] = numeric
-            df["wind_speed_mph"] = (numeric / 1.60934).round(2)
+        df["wind_speed_kmh"] = numeric
+        df["wind_speed_mph"] = (numeric / 1.60934).round(2)
         df.drop(columns=["wind_speed"], inplace=True)
 
     df = df.sort_values("timestamp").reset_index(drop=True)
@@ -458,6 +457,301 @@ def is_past_3pm_pacific(ts: datetime) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# NWS CLI (Climatological Report) — preliminary + final daily summary
+# ---------------------------------------------------------------------------
+
+# CLI issuedby suffix for each ICAO station (strip leading K)
+_CLI_SUFFIX = {
+    "KLAX": "LAX", "KMIA": "MIA", "KSFO": "SFO", "KORD": "ORD",
+    "KDEN": "DEN", "KPHX": "PHX", "KOKC": "OKC", "KATL": "ATL",
+    "KDFW": "DFW", "KSAT": "SAT", "KHOU": "HOU", "KMSP": "MSP",
+}
+
+
+def fetch_cli(site: str, version: int = 1) -> Optional[str]:
+    """Fetch a CLI product for *site*.
+
+    Parameters
+    ----------
+    site : str
+        ICAO station identifier (e.g. "KHOU").
+    version : int
+        1 = most recent (usually final, morning-after),
+        2 = previous (usually preliminary same-day ~4-7 PM local).
+        Higher versions go further back in history.
+
+    Returns
+    -------
+    The raw CLI text, or None if not found.
+    """
+    suffix = _CLI_SUFFIX.get(site.upper(), site.upper().lstrip("K"))
+    url = NWS_CLI_URL.format(suffix=suffix, version=version)
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        log.warning(f"CLI fetch failed for {site} v{version}: {e}")
+        return None
+
+    m = re.search(r"<pre[^>]*>(.*?)</pre>", resp.text, re.DOTALL)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def parse_cli(text: str) -> Optional[Dict]:
+    """Parse a CLI product text into structured data.
+
+    Returns
+    -------
+    Dict with keys:
+        site_name : str — e.g. "HOUSTON/HOBBY AIRPORT"
+        date : str — e.g. "MARCH 27 2026"
+        issued : str — e.g. "424 PM CDT FRI MAR 27 2026"
+        is_preliminary : bool — True if "VALID TODAY" / "VALID AS OF"
+        max_temp_f : int or None
+        max_temp_time : str or None — e.g. "2:59 PM"
+        min_temp_f : int or None
+        min_temp_time : str or None
+    Or None if parsing fails.
+    """
+    if not text:
+        return None
+
+    result: Dict = {
+        "site_name": None,
+        "date": None,
+        "issued": None,
+        "is_preliminary": False,
+        "max_temp_f": None,
+        "max_temp_time": None,
+        "min_temp_f": None,
+        "min_temp_time": None,
+    }
+
+    # Preliminary flag
+    result["is_preliminary"] = "VALID TODAY" in text or "VALID AS OF" in text
+
+    # Site name + date from "...THE <SITE> CLIMATE SUMMARY FOR <DATE>..."
+    m = re.search(
+        r"\.\.\.THE\s+(.+?)\s+CLIMATE SUMMARY FOR\s+(.+?)\.\.\.",
+        text,
+    )
+    if m:
+        result["site_name"] = m.group(1).strip()
+        result["date"] = m.group(2).strip()
+
+    # Issuance time — line with AM/PM and a year
+    for line in text.split("\n"):
+        line = line.strip()
+        if re.search(r"\d{1,2}\s+[AP]M\s+\w+\s+\w+\s+\w+\s+\d+\s+\d{4}", line):
+            result["issued"] = line
+            break
+
+    # Temperature section — MAXIMUM and MINIMUM lines
+    # Format:  "  MAXIMUM         86   2:59 PM  88    1935  76     10       73"
+    # or:      "  MAXIMUM         54    359 PM  78    1988  59     -5       76"
+    # or:      "  MAXIMUM         80R  2:52 PM  ..." (R = record set/tied)
+    # or:      "  MAXIMUM         39        MM  ..." (MM = missing time)
+    m = re.search(
+        r"MAXIMUM\s+(-?\d+)R?\s+([\d:]+\s*[AP]M|MM)",
+        text,
+    )
+    if m:
+        result["max_temp_f"] = int(m.group(1))
+        time_str = m.group(2).strip()
+        if time_str != "MM":
+            result["max_temp_time"] = time_str
+
+    m = re.search(
+        r"MINIMUM\s+(-?\d+)R?\s+([\d:]+\s*[AP]M|MM)",
+        text,
+    )
+    if m:
+        result["min_temp_f"] = int(m.group(1))
+        time_str = m.group(2).strip()
+        if time_str != "MM":
+            result["min_temp_time"] = time_str
+
+    return result
+
+
+def fetch_all_cli_today(
+    site: str,
+    max_versions: int = 5,
+) -> list:
+    """Fetch all CLI reports for today's date.
+
+    Scans versions 1..max_versions and collects every report whose
+    date matches the most recent report's date (i.e. today).
+
+    Returns a list of parsed dicts, ordered most-recent-first.
+    Each dict has keys: site_name, date, issued, is_preliminary,
+    max_temp_f, max_temp_time, min_temp_f, min_temp_time.
+    """
+    reports = []
+    target_date = None
+    for v in range(1, max_versions + 1):
+        text = fetch_cli(site, version=v)
+        if not text:
+            continue
+        parsed = parse_cli(text)
+        if not parsed or parsed.get("max_temp_f") is None:
+            continue
+        if target_date is None:
+            target_date = parsed.get("date")
+        if parsed.get("date") != target_date:
+            break  # older day — stop
+        parsed["version"] = v
+        reports.append(parsed)
+
+    if reports:
+        log.info(f"[{site}] Found {len(reports)} CLI report(s) for {target_date}: "
+                 + ", ".join(f"v{r['version']}={r['max_temp_f']}F"
+                             + (" (prelim)" if r["is_preliminary"] else "")
+                             for r in reports))
+    return reports
+
+
+# ---------------------------------------------------------------------------
+# DSM (ASOS Daily Summary Message) via IEM AFOS archive
+# ---------------------------------------------------------------------------
+
+IEM_AFOS_LIST_URL = "https://mesonet.agron.iastate.edu/api/1/nws/afos/list.json"
+
+
+def _parse_dsm_text(text: str) -> Optional[Dict]:
+    """Parse a raw DSM coded message.
+
+    Format example:
+        KATL DS 1500 28/03 701441/ 490743// 70/ 49//...
+
+    Fields (slash-delimited):
+        station DS time dd/mm maxHHMM/ minHHMM// max/ min//...
+    where max/min are °F, HHMM is local time of occurrence.
+    'M' means missing.
+    """
+    if not text:
+        return None
+
+    # Find the DS line — starts with K followed by station ID
+    ds_line = None
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if " DS " in line and line.startswith("K"):
+            ds_line = line
+            break
+    if not ds_line:
+        return None
+
+    # Parse: KXXX DS HHMM dd/mm {max}{HHMM}/ {min}{HHMM}// ...
+    # Temp is 2-3 digits, time is always 4 digits (HHMM local).
+    # M = missing for either field.
+    m = re.match(
+        r"(K\w+)\s+DS\s+(?:COR\s+)?(\d{4}|\w+)\s+(\d{1,2}/\d{2})\s+"
+        r"(-?\d{2,3}|M)(\d{4})?/\s*(-?\d{2,3}|M)(\d{4})?/",
+        ds_line,
+    )
+    if not m:
+        return None
+
+    station = m.group(1)
+    obs_time = m.group(2)  # UTC time of report e.g. "1500"
+    date_str = m.group(3)  # dd/mm
+
+    max_raw = m.group(4)
+    max_time_raw = m.group(5)  # HHMM local or None
+    min_raw = m.group(6)
+    min_time_raw = m.group(7)
+
+    result: Dict = {
+        "station": station,
+        "obs_time_utc": obs_time,
+        "date": date_str,
+        "max_temp_f": int(max_raw) if max_raw != "M" else None,
+        "max_temp_time": None,
+        "min_temp_f": int(min_raw) if min_raw != "M" else None,
+        "min_temp_time": None,
+    }
+
+    if max_time_raw and len(max_time_raw) == 4:
+        result["max_temp_time"] = f"{int(max_time_raw[:2])}:{max_time_raw[2:]}"
+    if min_time_raw and len(min_time_raw) == 4:
+        result["min_temp_time"] = f"{int(min_time_raw[:2])}:{min_time_raw[2:]}"
+
+    return result
+
+
+def fetch_dsm_today(site: str, station_tz: Optional[str] = None) -> list:
+    """Fetch all DSM reports for today from IEM AFOS archive.
+
+    Parameters
+    ----------
+    site : str
+        ICAO station identifier (e.g. "KHOU").
+    station_tz : str, optional
+        IANA timezone (e.g. "America/Chicago").  Used to determine
+        today's date for filtering.  Falls back to UTC.
+
+    Returns
+    -------
+    List of parsed DSM dicts, ordered oldest-first.
+    Each dict has: station, obs_time_utc, date, max_temp_f,
+    max_temp_time, min_temp_f, min_temp_time.
+    """
+    suffix = site.upper().lstrip("K")
+    pil = f"DSM{suffix}"
+
+    if station_tz:
+        _tz = ZoneInfo(station_tz)
+        _now = datetime.now(_tz)
+    else:
+        _now = datetime.utcnow()
+    today_str = _now.strftime("%Y-%m-%d")
+    # DSM date field is dd/mm — compute expected value for today
+    today_ddmm = _now.strftime("%d/%m")
+
+    try:
+        resp = requests.get(IEM_AFOS_LIST_URL, params={
+            "pil": pil,
+            "date": today_str,
+        }, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"[{site}] IEM DSM list failed: {e}")
+        return []
+
+    rows = data.get("data", [])
+    if not rows:
+        return []
+
+    reports = []
+    for row in rows:
+        text_url = row.get("text_link")
+        if not text_url:
+            continue
+        try:
+            r = requests.get(text_url, timeout=10)
+            r.raise_for_status()
+            parsed = _parse_dsm_text(r.text)
+            if parsed and parsed["max_temp_f"] is not None:
+                # Filter: DSM date must match today (station local)
+                if parsed.get("date") != today_ddmm:
+                    log.debug(f"[{site}] DSM date mismatch: {parsed.get('date')} vs {today_ddmm}")
+                    continue
+                parsed["entered"] = row.get("entered")
+                reports.append(parsed)
+        except Exception as e:
+            log.debug(f"[{site}] DSM text fetch failed: {e}")
+
+    if reports:
+        log.info(f"[{site}] Found {len(reports)} DSM report(s): "
+                 + ", ".join(f"{r['obs_time_utc']}={r['max_temp_f']}F" for r in reports))
+    return reports
+
+
+# ---------------------------------------------------------------------------
 # Solar noon (sunrisesunset.io API)
 # ---------------------------------------------------------------------------
 
@@ -567,7 +861,39 @@ def main():
                         help="Hours of data to fetch (default: 24)")
     parser.add_argument("--csv", type=str, default="weather.csv",
                         help="Output CSV filename (default: weather.csv)")
+    parser.add_argument("--cli", action="store_true",
+                        help="Fetch and parse NWS CLI report instead of Synoptic data")
+    parser.add_argument("--dsm", action="store_true",
+                        help="Fetch DSM reports from IEM AFOS archive")
     args = parser.parse_args()
+
+    if args.dsm:
+        print(f"=== DSM (IEM AFOS) — {args.site} ===")
+        reports = fetch_dsm_today(args.site)
+        if reports:
+            for r in reports:
+                print(f"  [{r['obs_time_utc']} UTC] {r['station']}")
+                print(f"    Max: {r['max_temp_f']}F at {r['max_temp_time']}")
+                print(f"    Min: {r['min_temp_f']}F at {r['min_temp_time']}")
+        else:
+            print("  No DSM reports found")
+        return
+
+    if args.cli:
+        print(f"=== NWS CLI — {args.site} ===")
+        reports = fetch_all_cli_today(args.site)
+        if reports:
+            for r in reports:
+                tag = "PRELIMINARY" if r["is_preliminary"] else "FINAL"
+                print(f"  [{tag}] v{r.get('version', '?')}")
+                print(f"    Site:    {r['site_name']}")
+                print(f"    Date:    {r['date']}")
+                print(f"    Issued:  {r['issued']}")
+                print(f"    Max:     {r['max_temp_f']}F at {r['max_temp_time']}")
+                print(f"    Min:     {r['min_temp_f']}F at {r['min_temp_time']}")
+        else:
+            print("  No CLI reports found")
+        return
 
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", None)

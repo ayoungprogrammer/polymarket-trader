@@ -1,4 +1,4 @@
-"""Unified site configuration loaded from configs/weather/sites.json.
+"""Unified site configuration loaded from configs/weather/sites.yaml.
 
 Provides two backward-compatible dicts so existing code keeps working:
 
@@ -8,27 +8,28 @@ Provides two backward-compatible dicts so existing code keeps working:
 """
 from __future__ import annotations
 
-import json
 import os
 from typing import Dict, List, Tuple
+
+import yaml
 
 _CONFIG_DIR = os.path.normpath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "configs", "weather")
 )
-_CONFIG_PATH = os.path.join(_CONFIG_DIR, "sites.json")
-_TRAINING_CONFIG_PATH = os.path.join(_CONFIG_DIR, "training_sites.json")
+_CONFIG_PATH = os.path.join(_CONFIG_DIR, "sites.yaml")
+_TRAINING_CONFIG_PATH = os.path.join(_CONFIG_DIR, "training_sites.yaml")
 
 
 def _load() -> dict:
     with open(_CONFIG_PATH) as f:
-        return json.load(f)
+        return yaml.safe_load(f)
 
 
 def _load_training() -> dict:
     if not os.path.isfile(_TRAINING_CONFIG_PATH):
         return {}
     with open(_TRAINING_CONFIG_PATH) as f:
-        return json.load(f)
+        return yaml.safe_load(f) or {}
 
 
 _DATA: dict = _load()
@@ -62,7 +63,11 @@ ALL_SITES_WITH_TRAINING: List[str] = sorted(set(ALL_SITES) | set(TRAINING_SITES)
 
 def get_site_config(site: str) -> dict:
     """Return the full config dict for a site, or raise KeyError."""
-    return _DATA[site]
+    if site in _DATA:
+        return _DATA[site]
+    if site in _TRAINING_DATA:
+        return _TRAINING_DATA[site]
+    raise KeyError(f"Unknown site: {site}")
 
 
 if __name__ == "__main__":

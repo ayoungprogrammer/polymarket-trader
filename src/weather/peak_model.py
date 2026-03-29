@@ -38,14 +38,14 @@ from weather.backtest_peak import (
     _print_calibration,
 )
 from weather.backtest import precompute_day_momentum
-from weather.prediction import compute_momentum
+from weather.sites import ALL_SITES
 
 # ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
 
 
-SAMPLES_CACHE = project_path("data", "peak_samples.pkl")
+SAMPLES_CACHE = project_path("data", "weather", "peak_samples.pkl")
 
 
 def _make_model():
@@ -53,13 +53,14 @@ def _make_model():
     from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
     from sklearn.ensemble import HistGradientBoostingClassifier
     return HistGradientBoostingClassifier(
-        max_iter=200, max_depth=4, learning_rate=0.1,
-        min_samples_leaf=5, random_state=42,
+        max_iter=400, max_depth=7, learning_rate=0.2,
+        min_samples_leaf=20, random_state=42,
     )
 
 
 def _load_samples(sites: Optional[List[str]] = None,
-                  no_cache: bool = False) -> pd.DataFrame:
+                  no_cache: bool = False,
+                  since: Optional[str] = None) -> pd.DataFrame:
     """Load samples, using a pickle cache to skip recomputation."""
     cache = SAMPLES_CACHE
     if not no_cache and os.path.isfile(cache):
@@ -67,11 +68,14 @@ def _load_samples(sites: Optional[List[str]] = None,
         df = pd.read_pickle(cache)
         if sites is not None:
             df = df[df["site"].isin(sites)]
+        if since:
+            df = df[df["date"] >= since].reset_index(drop=True)
+            print(f"  Filtered to dates >= {since}: {len(df)} rows")
         return df
 
     print("Loading and generating samples...")
-    df = load_all_samples(sites)
-    if not df.empty and sites is None:
+    df = load_all_samples(sites, since=since)
+    if not df.empty and sites is None and since is None:
         os.makedirs(os.path.dirname(cache), exist_ok=True)
         df.to_pickle(cache)
         print(f"  Cached {len(df)} samples to {cache}")
@@ -79,9 +83,10 @@ def _load_samples(sites: Optional[List[str]] = None,
 
 
 def train(sites: Optional[List[str]] = None,
-          no_cache: bool = False) -> dict:
+          no_cache: bool = False,
+          since: Optional[str] = None) -> dict:
     """Train HistGBM on all historical data and return model bundle."""
-    df = _load_samples(sites, no_cache=no_cache)
+    df = _load_samples(sites, no_cache=no_cache, since=since)
     if df.empty:
         raise RuntimeError("No samples generated. Check data files.")
 
@@ -95,19 +100,39 @@ def train(sites: Optional[List[str]] = None,
     y = df[LABEL].values
 
     model = _make_model()
-    print("  Training HistGBM...")
+    print("  Training HistGBM (>1°F)...")
     model.fit(X, y)
 
     # Feature importances
     if hasattr(model, "feature_importances_"):
         importances = model.feature_importances_
         top_idx = np.argsort(importances)[::-1][:10]
-        print("  Top 10 features:")
+        print("  Top 10 features (>1°F):")
         for rank, idx in enumerate(top_idx, 1):
             print(f"    {rank:>2}. {FEATURE_COLS[idx]:<30s} {importances[idx]:.4f}")
 
+    # Train >2°F model
+    LABEL_2 = "will_increase_2f"
+    model_2f = None
+    if LABEL_2 in df.columns:
+        y2 = df[LABEL_2].values
+        n_pos2 = int(y2.sum())
+        n_neg2 = len(y2) - n_pos2
+        print(f"\n  >2°F class balance: {n_pos2} positive ({n_pos2 / len(df):.1%}), "
+              f"{n_neg2} negative ({n_neg2 / len(df):.1%})")
+        model_2f = _make_model()
+        print("  Training HistGBM (>2°F)...")
+        model_2f.fit(X, y2)
+        if hasattr(model_2f, "feature_importances_"):
+            importances2 = model_2f.feature_importances_
+            top_idx2 = np.argsort(importances2)[::-1][:10]
+            print("  Top 10 features (>2°F):")
+            for rank, idx in enumerate(top_idx2, 1):
+                print(f"    {rank:>2}. {FEATURE_COLS[idx]:<30s} {importances2[idx]:.4f}")
+
     bundle = {
         "model": model,
+        "model_2f": model_2f,
         "features": FEATURE_COLS,
         "trained_at": datetime.utcnow().isoformat(),
         "n_samples": len(df),
@@ -116,84 +141,33 @@ def train(sites: Optional[List[str]] = None,
     return bundle
 
 
-def _run_one_fold(args_tuple):
-    """Train/eval one LOSO fold. Designed for joblib.Parallel."""
-    test_site, X_all, y_all, site_labels, feature_cols = args_tuple
-    from sklearn.base import clone
-    from sklearn.metrics import accuracy_score, f1_score
-
-    train_mask = site_labels != test_site
-    test_mask = site_labels == test_site
-
-    X_train, y_train = X_all[train_mask], y_all[train_mask]
-    X_test, y_test = X_all[test_mask], y_all[test_mask]
-
-    if len(X_test) < 10:
-        return None
-
-    model = _make_model()
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    y_prob = model.predict_proba(X_test)[:, 1]
-
-    return {
-        "site": test_site,
-        "n_test": len(X_test),
-        "accuracy": accuracy_score(y_test, y_pred),
-        "f1": f1_score(y_test, y_pred, zero_division=0),
-        "pos_pct": float(y_test.mean()),
-        "y_true": y_test,
-        "y_pred": y_pred,
-        "y_prob": y_prob,
-    }
-
-
-def train_loso(sites: Optional[List[str]] = None,
-               no_cache: bool = False) -> dict:
-    """Leave-one-site-out CV with HistGBM. Default CLI action."""
-    from joblib import Parallel, delayed
+def _run_loso_label(df: pd.DataFrame, label_col: str, label_name: str) -> dict:
+    """LOSO eval for one label. Tests only Kalshi sites, 2026+ data."""
     from sklearn.metrics import (
         accuracy_score, precision_score, recall_score, f1_score,
         classification_report,
     )
 
-    df = _load_samples(sites, no_cache=no_cache)
-    if df.empty:
-        raise RuntimeError("No samples generated. Check data files.")
-
     all_sites = sorted(df["site"].unique())
-    n_pos = (df[LABEL] == 1).sum()
-    n_neg = (df[LABEL] == 0).sum()
-    n_days = df.groupby(["site", "date"]).ngroups
-    print(f"\n  Dataset: {len(df)} samples, {n_days} site-days, {len(all_sites)} sites")
-    print(f"  Class balance: {n_pos} positive ({n_pos / len(df):.1%}), "
-          f"{n_neg} negative ({n_neg / len(df):.1%})")
+    test_sites = sorted(s for s in all_sites if s in ALL_SITES)
+    train_only = sorted(s for s in all_sites if s not in ALL_SITES)
 
-    pos_rate = df[LABEL].mean()
+    pos_rate = df[label_col].mean()
     baseline_acc = max(pos_rate, 1 - pos_rate)
-    baseline_label = "always-1" if pos_rate >= 0.5 else "always-0"
+    baseline_label = "always-0" if pos_rate < 0.5 else "always-1"
 
     print(f"\n{'=' * 70}")
-    print(f"  LEAVE-ONE-SITE-OUT CV ({len(all_sites)} sites)")
+    print(f"  LEAVE-ONE-SITE-OUT CV — {label_name}")
+    print(f"  Test sites: {len(test_sites)} (Kalshi)  |  Train-only: {len(train_only)}")
+    print(f"  Test data: 2026-01-01 onward")
     print(f"{'=' * 70}")
+
+    n_pos = int((df[label_col] == 1).sum())
+    n_neg = len(df) - n_pos
+    print(f"  Class balance: {n_pos} positive ({n_pos / len(df):.1%}), "
+          f"{n_neg} negative ({n_neg / len(df):.1%})")
     print(f"  Baseline ({baseline_label}): {baseline_acc:.1%}\n")
 
-    # Pre-extract arrays once for all folds
-    X_all = df[FEATURE_COLS].values
-    y_all = df[LABEL].values
-    site_labels = df["site"].values
-
-    # Run folds in parallel
-    fold_args = [
-        (site, X_all, y_all, site_labels, FEATURE_COLS)
-        for site in all_sites
-    ]
-    print(f"  Training {len(all_sites)} folds in parallel...")
-    results = Parallel(n_jobs=-1, prefer="threads")(
-        delayed(_run_one_fold)(a) for a in fold_args
-    )
-
-    # Collect results
     per_site = []
     all_y_true = []
     all_y_pred = []
@@ -202,25 +176,47 @@ def train_loso(sites: Optional[List[str]] = None,
     print(f"  {'Site':<6} {'N':>6} {'Acc':>7} {'F1':>7} {'Pos%':>7}")
     print(f"  {'-'*6} {'-'*6} {'-'*7} {'-'*7} {'-'*7}")
 
-    for r in results:
-        if r is None:
+    for test_site in test_sites:
+        test_mask = (df["site"] == test_site) & (df["date"] >= "2026-01-01")
+        train_df = df[~test_mask]
+        test_df = df[test_mask]
+        if len(test_df) < 10:
             continue
+
+        X_train = train_df[FEATURE_COLS].values
+        y_train = train_df[label_col].values
+        X_test = test_df[FEATURE_COLS].values
+        y_test = test_df[label_col].values
+
+        model = _make_model()
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)[:, 1]
+
+        acc = accuracy_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+
         per_site.append({
-            "site": r["site"],
-            "n_test": r["n_test"],
-            "accuracy": r["accuracy"],
-            "f1": r["f1"],
-            "pos_pct": r["pos_pct"],
+            "site": test_site,
+            "n_test": len(test_df),
+            "accuracy": acc,
+            "f1": f1,
+            "pos_pct": float(y_test.mean()),
         })
-        print(f"  {r['site']:<6} {r['n_test']:>6} {r['accuracy']:>7.4f} "
-              f"{r['f1']:>7.4f} {r['pos_pct']:>6.1%}")
-        all_y_true.extend(r["y_true"])
-        all_y_pred.extend(r["y_pred"])
-        all_y_prob.extend(r["y_prob"])
+        print(f"  {test_site:<6} {len(test_df):>6} {acc:>7.4f} "
+              f"{f1:>7.4f} {y_test.mean():>6.1%}")
+
+        all_y_true.extend(y_test)
+        all_y_pred.extend(y_pred)
+        all_y_prob.extend(y_prob)
 
     all_y_true = np.array(all_y_true)
     all_y_pred = np.array(all_y_pred)
     all_y_prob = np.array(all_y_prob)
+
+    if len(all_y_true) == 0:
+        print("  No test results.")
+        return {"accuracy": 0, "f1": 0, "per_site": []}
 
     overall_acc = accuracy_score(all_y_true, all_y_pred)
     overall_f1 = f1_score(all_y_true, all_y_pred, zero_division=0)
@@ -235,33 +231,48 @@ def train_loso(sites: Optional[List[str]] = None,
     print(f"  Mean acc: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
     print(f"  Mean F1:  {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
 
-    print(f"\n{classification_report(all_y_true, all_y_pred, target_names=['no_increase_f', 'will_increase_f'])}")
+    print(f"\n{classification_report(all_y_true, all_y_pred, target_names=[f'no_{label_name}', label_name])}")
 
     # Feature importances — train on full data
+    X_all = df[FEATURE_COLS].values
+    y_all = df[label_col].values
     full_model = _make_model()
     full_model.fit(X_all, y_all)
     if hasattr(full_model, "feature_importances_"):
         _print_feature_importances(full_model, FEATURE_COLS)
-    else:
-        # HistGBM in sklearn <1.0 lacks feature_importances_;
-        # use permutation importance instead.
-        from sklearn.inspection import permutation_importance
-        perm = permutation_importance(
-            full_model, X_all, y_all, n_repeats=5,
-            random_state=42, n_jobs=-1,
-        )
-        importances = perm.importances_mean
-        top_idx = np.argsort(importances)[::-1][:15]
-        print(f"\n  TOP 15 FEATURE IMPORTANCES (permutation)")
-        print(f"  {'-' * 40}")
-        for rank, idx in enumerate(top_idx, 1):
-            print(f"  {rank:>2}. {FEATURE_COLS[idx]:<30s} {importances[idx]:.4f}")
+
     _print_calibration(all_y_true, all_y_prob)
 
     return {
         "accuracy": overall_acc,
         "f1": overall_f1,
         "per_site": per_site,
+    }
+
+
+def train_loso(sites: Optional[List[str]] = None,
+               no_cache: bool = False,
+               since: Optional[str] = None) -> dict:
+    """Leave-one-site-out CV for both >1°F and >2°F labels."""
+    df = _load_samples(sites, no_cache=no_cache, since=since)
+    if df.empty:
+        raise RuntimeError("No samples generated. Check data files.")
+
+    n_days = df.groupby(["site", "date"]).ngroups
+    print(f"\n  Dataset: {len(df)} samples, {n_days} site-days, {df['site'].nunique()} sites")
+
+    result_1f = _run_loso_label(df, LABEL, ">1°F")
+
+    LABEL_2 = "will_increase_2f"
+    result_2f = None
+    if LABEL_2 in df.columns:
+        result_2f = _run_loso_label(df, LABEL_2, ">2°F")
+
+    return {
+        "accuracy": result_1f["accuracy"],
+        "f1": result_1f["f1"],
+        "per_site": result_1f["per_site"],
+        "result_2f": result_2f,
     }
 
 
@@ -316,6 +327,7 @@ def extract_live_features(
     forecast_high_f: float,
     solar_noon_hour: float = 12.0,
     forecast_hourly: Optional[List[Tuple[int, float]]] = None,
+    yesterday: Optional[Dict[str, float]] = None,
 ) -> Optional[dict]:
     """Extract peak features from live observation data.
 
@@ -330,6 +342,8 @@ def extract_live_features(
         Solar noon in decimal hours (default 12.0).
     forecast_hourly : list of (hour, temp_f), optional
         Hourly forecast curve for today.
+    yesterday : dict, optional
+        Prior day summary: {"high_f", "low_f", "peak_hour", "high_vs_forecast_f"}.
 
     Returns
     -------
@@ -355,10 +369,9 @@ def extract_live_features(
 
     df = df.sort_values("ts").reset_index(drop=True)
 
-    # Precompute momentum arrays
+    # Precompute momentum arrays (precompute_day_momentum already calls
+    # compute_momentum and caches _mom_df in the returned dict)
     precomp = precompute_day_momentum(df)
-    mom_df = compute_momentum(df)
-    precomp["_mom_df"] = mom_df
 
     # Use the last observation as the sample point
     as_of_idx = len(df) - 1
@@ -372,6 +385,7 @@ def extract_live_features(
         df, precomp, as_of_idx, solar_noon_hour,
         actual_max_c_placeholder, forecast_high_f,
         forecast_hourly=forecast_hourly,
+        yesterday=yesterday,
     )
     if feats is None:
         return None
@@ -392,8 +406,9 @@ def predict(
     forecast_high_f: float,
     solar_noon_hour: float = 12.0,
     forecast_hourly: Optional[List[Tuple[int, float]]] = None,
+    yesterday: Optional[Dict[str, float]] = None,
 ) -> Optional[dict]:
-    """Predict whether the settlement °F will increase by +1.
+    """Predict whether the settlement °F will increase by +1 and +2.
 
     Parameters
     ----------
@@ -412,15 +427,18 @@ def predict(
     -------
     dict or None
         {
-            "probability": float,   # P(will_increase_f=1)
-            "prediction": bool,     # probability >= 0.5
-            "cur_naive_f": int,     # current naive_f from auto-obs
-            "features": dict,       # extracted features
+            "probability": float,       # P(will_increase >= 1°F)
+            "probability_2f": float,    # P(will_increase >= 2°F)
+            "prediction": bool,         # probability >= 0.5
+            "prediction_2f": bool,      # probability_2f >= 0.5
+            "cur_naive_f": int,         # current naive_f from auto-obs
+            "features": dict,           # extracted features
         }
     """
     feats = extract_live_features(
         obs_df, forecast_high_f, solar_noon_hour,
         forecast_hourly=forecast_hourly,
+        yesterday=yesterday,
     )
     if feats is None:
         return None
@@ -432,19 +450,22 @@ def predict(
     X = np.array([[feats.get(col, 0.0) for col in feature_cols]])
     prob = float(clf.predict_proba(X)[0, 1])
 
+    # >2°F model (may not exist in older bundles)
+    clf_2f = model_bundle.get("model_2f")
+    if clf_2f is not None:
+        prob_2f = float(clf_2f.predict_proba(X)[0, 1])
+    else:
+        prob_2f = 0.0
+
     # Recover cur_naive_f from features
-    cur_f_fractional = feats.get("cur_f_fractional", 0.0)
-    # cur_f_fractional is the fractional part of cur_f_float
-    # We need to reconstruct naive_f from the observation data
-    # Use the forecast_gap_f: forecast_high_f - cur_max = forecast_gap_f
-    # So cur_max = forecast_high_f - forecast_gap_f
     cur_max_f = forecast_high_f - feats.get("forecast_gap_f", 0.0)
-    # cur_max_f is in °F (running max of observations)
     cur_naive_f = round(cur_max_f)
 
     return {
         "probability": prob,
+        "probability_2f": prob_2f,
         "prediction": prob >= 0.5,
+        "prediction_2f": prob_2f >= 0.5,
         "cur_naive_f": cur_naive_f,
         "features": feats,
     }
@@ -466,16 +487,23 @@ def main() -> None:
                         help="Train on all data and persist model to disk")
     parser.add_argument("--no-cache", action="store_true",
                         help="Rebuild samples from CSVs (ignore pickle cache)")
+    parser.add_argument("--use-all-sites", action="store_true",
+                        help="Include all training sites (default: Kalshi sites only)")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Only use data from this date (YYYY-MM-DD)")
     args = parser.parse_args()
 
     sites = args.site.split(",") if args.site else None
+    if sites is None and args.use_all_sites:
+        from weather.backtest_rounding import ALL_SITES_WITH_TRAINING
+        sites = list(ALL_SITES_WITH_TRAINING)
 
     if args.save:
         print("=" * 60)
         print("  PEAK MODEL — TRAIN & SAVE")
         print("=" * 60)
         print()
-        bundle = train(sites, no_cache=args.no_cache)
+        bundle = train(sites, no_cache=args.no_cache, since=args.since)
         path = save_model(bundle)
         print(f"\n  {path}")
     else:
@@ -483,7 +511,7 @@ def main() -> None:
         print("  PEAK MODEL — LEAVE-ONE-SITE-OUT EVALUATION")
         print(f"  Label: {LABEL}")
         print("=" * 70)
-        train_loso(sites, no_cache=args.no_cache)
+        train_loso(sites, no_cache=args.no_cache, since=args.since)
 
     print("\nDone.")
 

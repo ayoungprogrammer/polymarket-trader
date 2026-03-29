@@ -26,7 +26,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from weather.backtest import load_site_history, ALL_SITES
+from weather.backtest import load_site_history
+from weather.sites import ALL_SITES, ALL_SITES_WITH_TRAINING
 from weather.backtest_rounding import extract_regression_features, FEATURE_COLS, SOLAR_NOON_CSV
 from paths import project_path
 
@@ -77,6 +78,9 @@ def load_feature_dataframe(
     rdf = pd.DataFrame(rows)
     if rdf.empty:
         return rdf
+
+    # Day of year (raw integer 1-366)
+    rdf["day_of_year"] = pd.to_datetime(rdf["date"]).dt.dayofyear
 
     # Cross-day lagged features (same as backtest_regression)
     rdf = rdf.sort_values(["site", "date"]).reset_index(drop=True)
@@ -475,6 +479,162 @@ def plot_true_vs_auto(rdf: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# 7. max_c vs offset label
+# ---------------------------------------------------------------------------
+
+def plot_max_c_vs_offset(rdf: pd.DataFrame):
+    """Plot offset class distribution as a function of max_c (whole-degree C)."""
+    if "max_c" not in rdf.columns or "offset" not in rdf.columns:
+        print("  Missing max_c or offset — skipping max_c vs offset plot.")
+        return
+
+    max_c = rdf["max_c"].values.astype(float)
+    offset = rdf["offset"].values.astype(int)
+    colors_map = {-1: "#F44336", 0: "#FFC107", 1: "#4CAF50"}
+
+    # Bin max_c into integer values
+    c_vals = sorted(set(int(v) for v in max_c if not np.isnan(v)))
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
+                                    gridspec_kw={"height_ratios": [2, 1]})
+
+    # Top: stacked bar of offset proportions per max_c
+    width = 0.8
+    bottom = np.zeros(len(c_vals))
+    for cls in [-1, 0, 1]:
+        fracs = []
+        for c in c_vals:
+            mask = max_c.astype(int) == c
+            total = mask.sum()
+            fracs.append((offset[mask] == cls).sum() / total if total > 0 else 0)
+        ax1.bar(range(len(c_vals)), fracs, width, bottom=bottom,
+                label=f"offset={cls:+d}", color=colors_map[cls], alpha=0.8)
+        bottom += fracs
+
+    # Add sample count labels on top of each stacked bar
+    for i, c in enumerate(c_vals):
+        n = int((max_c.astype(int) == c).sum())
+        ax1.text(i, 1.01, str(n), ha="center", va="bottom",
+                 fontsize=5, rotation=90, color="#555555")
+
+    ax1.set_ylabel("Proportion")
+    ax1.set_title("Offset class distribution by max_c (°C)")
+    ax1.legend(fontsize=8)
+    ax1.set_ylim(0, 1.15)
+
+    # Bottom: sample count per max_c
+    counts = [int((max_c.astype(int) == c).sum()) for c in c_vals]
+    ax2.bar(range(len(c_vals)), counts, width, color="#90CAF9", alpha=0.8)
+    ax2.set_ylabel("Count")
+    ax2.set_xlabel("max_c (°C)")
+    ax2.set_xticks(range(len(c_vals)))
+    ax2.set_xticklabels([str(c) for c in c_vals], rotation=90, fontsize=6)
+
+    fig.tight_layout()
+    path = os.path.join(EDA_DIR, "max_c_vs_offset.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {path}")
+
+
+# ---------------------------------------------------------------------------
+# 8. All feature distributions (histograms by offset class)
+# ---------------------------------------------------------------------------
+
+def plot_all_feature_distributions(
+    rdf: pd.DataFrame,
+    feature_cols: List[str],
+):
+    """Histogram of every feature, coloured by offset class, plus the label."""
+    offset = rdf["offset"].values.astype(int)
+    classes = sorted(set(offset))
+    colors_map = {-1: "#F44336", 0: "#FFC107", 1: "#4CAF50"}
+
+    # Include offset itself as the first "column"
+    all_cols = ["offset"] + list(feature_cols)
+    n = len(all_cols)
+    n_cols = 4
+    n_rows = (n + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
+    axes = axes.flatten()
+
+    for idx, col in enumerate(all_cols):
+        ax = axes[idx]
+        vals = rdf[col].dropna().values.astype(float) if col in rdf.columns else np.array([])
+        if len(vals) == 0:
+            ax.set_visible(False)
+            continue
+
+        for cls in classes:
+            cls_vals = rdf.loc[offset == cls, col].dropna().values.astype(float)
+            if len(cls_vals) == 0:
+                continue
+            ax.hist(cls_vals, bins=50, alpha=0.5,
+                    color=colors_map.get(cls, "#999999"),
+                    label=f"{cls:+d}", density=True)
+        ax.set_title(col, fontsize=7)
+        ax.tick_params(labelsize=6)
+        if idx == 0:
+            ax.legend(fontsize=6)
+
+    for idx in range(len(all_cols), len(axes)):
+        axes[idx].set_visible(False)
+
+    fig.suptitle("Feature distributions by offset class", fontsize=11)
+    fig.tight_layout()
+    path = os.path.join(EDA_DIR, "all_feature_distributions.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {path}")
+
+
+# ---------------------------------------------------------------------------
+# 9. Per-site chronological offset grid
+# ---------------------------------------------------------------------------
+
+def plot_offset_timeline(rdf: pd.DataFrame):
+    """For each site, plot offset (+1, 0, -1) for each day chronologically."""
+    if "site" not in rdf.columns or "date" not in rdf.columns or "offset" not in rdf.columns:
+        print("  Missing columns — skipping offset timeline.")
+        return
+
+    sites = sorted(rdf["site"].unique())
+    colors_map = {-1: "#F44336", 0: "#FFC107", 1: "#4CAF50"}
+
+    n_sites = len(sites)
+    fig, axes = plt.subplots(n_sites, 1, figsize=(16, max(4, n_sites * 1.2)),
+                              sharex=False)
+    if n_sites == 1:
+        axes = [axes]
+
+    for i, site in enumerate(sites):
+        ax = axes[i]
+        site_df = rdf[rdf["site"] == site].sort_values("date").reset_index(drop=True)
+        dates = pd.to_datetime(site_df["date"])
+        offsets = site_df["offset"].values.astype(int)
+
+        point_colors = [colors_map.get(o, "#999999") for o in offsets]
+        ax.scatter(dates, offsets, c=point_colors, s=8, alpha=0.7, edgecolors="none")
+        ax.set_yticks([-1, 0, 1])
+        ax.set_yticklabels(["-1", "0", "+1"], fontsize=7)
+        ax.set_ylim(-1.5, 1.5)
+        ax.set_ylabel(site, fontsize=7, rotation=0, ha="right", va="center")
+        ax.tick_params(axis="x", labelsize=5)
+        ax.grid(axis="x", alpha=0.3, linewidth=0.5)
+
+        # Add a light horizontal line at 0
+        ax.axhline(0, color="#cccccc", linewidth=0.5)
+
+    fig.suptitle("Daily offset by site (chronological)", fontsize=11)
+    fig.tight_layout()
+    path = os.path.join(EDA_DIR, "offset_timeline.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -492,6 +652,8 @@ def run_eda(
         return
 
     feature_cols = list(FEATURE_COLS)
+    if "day_of_year" not in feature_cols:
+        feature_cols.append("day_of_year")
 
     # Drop rows with NA in any feature column
     available_cols = [c for c in feature_cols if c in rdf.columns]
@@ -522,7 +684,10 @@ def run_eda(
     plot_distributions_by_offset(rdf, available_cols, target, target_label, top_n=top_n)
     plot_mutual_information(rdf, available_cols, target, target_label)
     plot_true_vs_auto(rdf)
+    plot_max_c_vs_offset(rdf)
     plot_offset_by_site(rdf)
+    plot_all_feature_distributions(rdf, available_cols)
+    plot_offset_timeline(rdf)
 
     print(f"\nAll charts saved to {EDA_DIR}/")
 
@@ -536,11 +701,18 @@ def main():
                         help="Binary target: offset >= 0")
     parser.add_argument("--bracket-middle", action="store_true",
                         help="Binary target: offset > 0")
+    parser.add_argument("--all-sites", action="store_true",
+                        help="Include training-only sites (default: Kalshi sites only)")
     parser.add_argument("--top", type=int, default=100,
                         help="Top N features for distribution plots (default: 100)")
     args = parser.parse_args()
 
-    sites = args.site.split(",") if args.site else None
+    if args.site:
+        sites = args.site.split(",")
+    elif args.all_sites:
+        sites = ALL_SITES_WITH_TRAINING
+    else:
+        sites = None
     bracket_mode = None
     if args.bracket_upper:
         bracket_mode = "upper"

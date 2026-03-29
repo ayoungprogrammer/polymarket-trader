@@ -242,11 +242,45 @@ def run_strategy(
             log.info(f"Current: {current_temp}°F | Max: {observed_max}°F | Min: {observed_min}°F")
 
             # 6h METAR max/min (0.1°C precision — most accurate for CLI prediction)
+            metar_6h_readings = []
+            auto_max_since_last_metar_f = None
             if "max_temp_6h_f" in obs_df.columns:
                 metar6h = obs_df[["timestamp", "max_temp_6h_f", "min_temp_6h_f"]].dropna(subset=["max_temp_6h_f"])
                 if not metar6h.empty:
                     metar_6h_max = metar6h["max_temp_6h_f"].max()
                     log.info(f"6h METAR max: {metar_6h_max}°F")
+                    # Build multi-METAR readings list
+                    for _, _mr in metar6h.iterrows():
+                        metar_6h_readings.append({
+                            "timestamp_utc": str(_mr["timestamp"]),
+                            "value_f": float(_mr["max_temp_6h_f"]),
+                        })
+                    # Auto max since last METAR
+                    if metar_6h_readings and "temperature_f" in obs_df.columns:
+                        _last_ts = metar_6h_readings[-1]["timestamp_utc"]
+                        _after = obs_df[obs_df["timestamp"] > _last_ts]
+                        _after_temps = pd.to_numeric(_after["temperature_f"], errors="coerce").dropna()
+                        if not _after_temps.empty:
+                            auto_max_since_last_metar_f = float(_after_temps.max())
+
+            # Forecast (fetch early so forecast_peak_hour is available for bracket model)
+            _forecast_peak_hour = None
+            try:
+                fi = ForecastIngestion(site)
+                forecast_df = fi.fetch_forecast()
+                if not forecast_df.empty and "temperature_f" in forecast_df.columns:
+                    forecast_peak = forecast_df["temperature_f"].max()
+                    _fpeak_idx = forecast_df["temperature_f"].idxmax()
+                    peak_time = forecast_df.loc[_fpeak_idx, "timestamp"]
+                    log.info(f"Forecast peak: {forecast_peak}°F at {peak_time}")
+                    # Extract peak hour in local time
+                    _fpeak_ts = pd.to_datetime(peak_time)
+                    if _fpeak_ts.tzinfo is None:
+                        _fpeak_ts = _fpeak_ts.tz_localize("UTC")
+                    _fpeak_local = _fpeak_ts.tz_convert(station_tz)
+                    _forecast_peak_hour = _fpeak_local.hour + _fpeak_local.minute / 60.0
+            except Exception as e:
+                log.warning(f"Could not fetch forecast (early): {e}")
 
             # Bracket model probabilities
             try:
@@ -298,8 +332,6 @@ def run_strategy(
                                 max_c = feats.get("max_c")
                                 if max_c is not None:
                                     naive_f = round(float(max_c) * 9.0 / 5.0 + 32.0)
-                                    # Kalshi brackets are even-odd pairs: [64,65], [66,67], [68,69], ...
-                                    # Find the bracket containing naive_f
                                     if naive_f % 2 == 0:
                                         center_lo = naive_f
                                     else:
@@ -309,8 +341,15 @@ def run_strategy(
                             if brackets_parsed:
                                 bracket_tuples = [(lo, hi) for _, lo, hi in brackets_parsed]
                                 ticker_map = {(lo, hi): tk for tk, lo, hi in brackets_parsed}
-                                bprobs = get_probability(bmodel, feats, bracket_tuples,
-                                                         metar_6h_f=metar_6h_max)
+                                _site_tz_str = str(station_tz)
+                                bprobs = get_probability(
+                                    bmodel, feats, bracket_tuples,
+                                    metar_6h_f=metar_6h_max,
+                                    metar_6h_readings=metar_6h_readings if metar_6h_readings else None,
+                                    site_timezone=_site_tz_str,
+                                    auto_max_since_last_metar_f=auto_max_since_last_metar_f,
+                                    forecast_peak_hour=_forecast_peak_hour,
+                                )
                                 bprobs = [bp for bp in bprobs if bp["prob"] >= 0.005]
                                 bprobs.sort(key=lambda x: -x["prob"])
                                 if bprobs:
@@ -366,17 +405,18 @@ def run_strategy(
     except Exception as e:
         log.warning(f"Could not compute momentum: {e}")
 
-    # 3. Forecast
-    try:
-        fi = ForecastIngestion(site)
-        forecast_df = fi.fetch_forecast()
-        if not forecast_df.empty and "temperature_f" in forecast_df.columns:
-            forecast_peak = forecast_df["temperature_f"].max()
-            peak_idx = forecast_df["temperature_f"].idxmax()
-            peak_time = forecast_df.loc[peak_idx, "timestamp"]
-            log.info(f"Forecast peak: {forecast_peak}°F at {peak_time}")
-    except Exception as e:
-        log.warning(f"Could not fetch forecast: {e}")
+    # 3. Forecast (may already be fetched above for bracket model)
+    if forecast_df.empty:
+        try:
+            fi = ForecastIngestion(site)
+            forecast_df = fi.fetch_forecast()
+            if not forecast_df.empty and "temperature_f" in forecast_df.columns:
+                forecast_peak = forecast_df["temperature_f"].max()
+                peak_idx = forecast_df["temperature_f"].idxmax()
+                peak_time = forecast_df.loc[peak_idx, "timestamp"]
+                log.info(f"Forecast peak: {forecast_peak}°F at {peak_time}")
+        except Exception as e:
+            log.warning(f"Could not fetch forecast: {e}")
 
     # Generate momentum chart
     if not mom_df.empty:

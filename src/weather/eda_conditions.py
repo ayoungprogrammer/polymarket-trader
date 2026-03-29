@@ -17,6 +17,7 @@ import pandas as pd
 
 from weather.backtest_rounding import (
     ALL_SITES,
+    ALL_SITES_WITH_TRAINING,
     SOLAR_NOON_CSV,
     extract_regression_features,
     load_site_history,
@@ -151,6 +152,115 @@ def deep_analysis(rdf: pd.DataFrame):
     print("DEEP PATTERN ANALYSIS")
     print("=" * 90)
 
+    # --- max_c % 5 groups ---
+    print("\n--- max_c % 5 (C-to-F rounding cycle position) ---")
+    rdf["max_c_mod5"] = rdf["max_c"].astype(int) % 5
+    for val in range(5):
+        mask = rdf["max_c_mod5"] == val
+        sub = rdf.loc[mask, "offset"]
+        n_sub = len(sub)
+        if n_sub < 10:
+            continue
+        counts = sub.value_counts()
+        pct_m1 = counts.get(-1, 0) / n_sub
+        pct_0 = counts.get(0, 0) / n_sub
+        pct_p1 = counts.get(1, 0) / n_sub
+        print(f"  max_c%%5={val}  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # --- max_c % 5 + naive_is_high ---
+    print("\n--- max_c % 5 + naive_is_high ---")
+    for val in range(5):
+        for nih in [0, 1]:
+            mask = (rdf["max_c_mod5"] == val) & (rdf["naive_is_high"] == nih)
+            sub = rdf.loc[mask, "offset"]
+            n_sub = len(sub)
+            if n_sub < 10:
+                continue
+            counts = sub.value_counts()
+            pct_m1 = counts.get(-1, 0) / n_sub
+            pct_0 = counts.get(0, 0) / n_sub
+            pct_p1 = counts.get(1, 0) / n_sub
+            print(f"  mod5={val}, nih={nih}  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # --- max_c % 5 + dwell_count bins ---
+    print("\n--- max_c % 5 + dwell_count ---")
+    for val in range(5):
+        for dlo, dhi, dlabel in [(1, 5, "1-5"), (6, 20, "6-20"), (21, 999, "21+")]:
+            mask = (rdf["max_c_mod5"] == val) & (rdf["dwell_count"] >= dlo) & (rdf["dwell_count"] <= dhi)
+            sub = rdf.loc[mask, "offset"]
+            n_sub = len(sub)
+            if n_sub < 10:
+                continue
+            counts = sub.value_counts()
+            pct_m1 = counts.get(-1, 0) / n_sub
+            pct_0 = counts.get(0, 0) / n_sub
+            pct_p1 = counts.get(1, 0) / n_sub
+            print(f"  mod5={val}, dwell={dlabel:<5s}  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # --- max_c % 5 + single_reading_peak ---
+    print("\n--- max_c % 5 + single_reading_peak ---")
+    for val in range(5):
+        mask = (rdf["max_c_mod5"] == val) & (rdf["single_reading_peak"] == 1)
+        sub = rdf.loc[mask, "offset"]
+        n_sub = len(sub)
+        if n_sub < 10:
+            continue
+        counts = sub.value_counts()
+        pct_m1 = counts.get(-1, 0) / n_sub
+        pct_0 = counts.get(0, 0) / n_sub
+        pct_p1 = counts.get(1, 0) / n_sub
+        print(f"  mod5={val}, single_peak=1  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # --- max_c % 5 + volatility ---
+    print("\n--- max_c % 5 + temp_f_volatility_1hr ---")
+    for val in range(5):
+        for thr in [0.5, 0.8]:
+            mask = (rdf["max_c_mod5"] == val) & (rdf["temp_f_volatility_1hr"] <= thr)
+            sub = rdf.loc[mask, "offset"]
+            n_sub = len(sub)
+            if n_sub < 10:
+                continue
+            counts = sub.value_counts()
+            pct_m1 = counts.get(-1, 0) / n_sub
+            pct_0 = counts.get(0, 0) / n_sub
+            pct_p1 = counts.get(1, 0) / n_sub
+            print(f"  mod5={val}, vol_1hr<={thr}  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # --- max_c % 5 + metar_confirm ---
+    print("\n--- max_c % 5 + metar_confirm ---")
+    for val in range(5):
+        for thr in [0.1, 0.2, 0.3, 0.4]:
+            mask = (rdf["max_c_mod5"] == val) & (rdf["metar_confirm"] >= thr)
+            sub = rdf.loc[mask, "offset"]
+            n_sub = len(sub)
+            if n_sub < 10:
+                continue
+            counts = sub.value_counts()
+            pct_m1 = counts.get(-1, 0) / n_sub
+            pct_0 = counts.get(0, 0) / n_sub
+            pct_p1 = counts.get(1, 0) / n_sub
+            print(f"  mod5={val}, metar>={thr:.1f}  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
+    # --- max_c % 5 + metar_gap_c ---
+    print("\n--- max_c % 5 + metar_gap_c ---")
+    for val in range(5):
+        for thr in [0.1, 0.2, -0.3, -0.5]:
+            if thr > 0:
+                mask = (rdf["max_c_mod5"] == val) & (rdf["metar_gap_c"] >= thr)
+                cond = f">={thr:.1f}"
+            else:
+                mask = (rdf["max_c_mod5"] == val) & (rdf["metar_gap_c"] <= thr)
+                cond = f"<={thr:.1f}"
+            sub = rdf.loc[mask, "offset"]
+            n_sub = len(sub)
+            if n_sub < 10:
+                continue
+            counts = sub.value_counts()
+            pct_m1 = counts.get(-1, 0) / n_sub
+            pct_0 = counts.get(0, 0) / n_sub
+            pct_p1 = counts.get(1, 0) / n_sub
+            print(f"  mod5={val}, gap{cond}  n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}")
+
     # --- c_to_f_frac groups ---
     print("\n--- c_to_f_frac groups ---")
     for frac_val in sorted(rdf["c_to_f_frac"].dropna().unique()):
@@ -234,7 +344,7 @@ def deep_analysis(rdf: pd.DataFrame):
     # --- dwell_count + naive_is_high ---
     print("\n--- dwell_count >= threshold & naive_is_high ---")
     for nih in [0, 1]:
-        for dwell_thr in [20, 30, 40, 50]:
+        for dwell_thr in [5, 10, 15, 20, 30, 40, 50]:
             mask = (rdf["dwell_count"] >= dwell_thr) & (rdf["naive_is_high"] == nih)
             sub = rdf.loc[mask, "offset"]
             n_sub = len(sub)
@@ -486,26 +596,27 @@ def deep_analysis(rdf: pd.DataFrame):
     print("=" * 90)
 
     rules = [
-        ("n_possible_f == 1 (exact)", rdf["n_possible_f"] == 1, "clamp to 0 (92.8%)"),
-        ("naive_is_low & n_poss==2", (rdf["naive_is_high"] == 0) & (rdf["n_possible_f"] == 2), "clamp -1→0 (0.1%)"),
-        ("naive_is_high == 1", rdf["naive_is_high"] == 1, "clamp +1→0 (5.4%)"),
-        ("metar_above_boundary", rdf["metar_above_boundary"] == 1, "clamp -1→0 (0.0%)"),
-        ("metar_gap_c >= 0.25", rdf["metar_gap_c"] >= 0.25, "force +1 (100%)"),
-        ("metar_gap_c >= 0.2 & nih==0", (rdf["metar_gap_c"] >= 0.2) & (rdf["naive_is_high"] == 0), "force +1 (100%)"),
-        ("single_peak==1 & nih==0", (rdf["single_reading_peak"] == 1) & (rdf["naive_is_high"] == 0), "clamp +1→0?"),
-        ("single_peak==1 & nih==1", (rdf["single_reading_peak"] == 1) & (rdf["naive_is_high"] == 1), "strong -1 signal"),
-        ("vol_1hr<=0.5 & nih==0 & n_poss==2", (rdf["temp_f_volatility_1hr"] <= 0.5) & (rdf["naive_is_high"] == 0) & (rdf["n_possible_f"] == 2), "force 0 (100%?)"),
-        ("vol_1hr<=0.5 & nih==1", (rdf["temp_f_volatility_1hr"] <= 0.5) & (rdf["naive_is_high"] == 1), "force -1 (92.3%)"),
-        ("consec>=30 & nih==0", (rdf["consec_count"] >= 30) & (rdf["naive_is_high"] == 0), "force +1 (90.4%)"),
-        ("gap_below==1", rdf["peak_edge_f_gap_below"] == 1, "clamp -1→0 (0.3%)"),
-        ("gap_above==1", rdf["peak_edge_f_gap_above"] == 1, "clamp +1→0 (6.1%)"),
-        ("metar_gap_c<=-0.5 & nih==1", (rdf["metar_gap_c"] <= -0.5) & (rdf["naive_is_high"] == 1), "force -1 (89.3%)"),
-        ("dwell>=20 & nih==0", (rdf["dwell_count"] >= 20) & (rdf["naive_is_high"] == 0), "force +1 (82.0%)"),
-        ("vol_1hr<=0.6 & nih==1", (rdf["temp_f_volatility_1hr"] <= 0.6) & (rdf["naive_is_high"] == 1), "force -1 (83.8%)"),
-        ("metar_confirm>=0.2 & nih==0", (rdf["metar_confirm"] >= 0.2) & (rdf["naive_is_high"] == 0), "force +1 (100%)"),
+        ("n_possible_f == 1 (exact)", rdf["n_possible_f"] == 1),
+        ("naive_is_low & n_poss==2", (rdf["naive_is_high"] == 0) & (rdf["n_possible_f"] == 2)),
+        ("naive_is_high == 0", (rdf["naive_is_high"] == 0)),
+        ("naive_is_high == 1", rdf["naive_is_high"] == 1),
+        ("metar_above_boundary", rdf["metar_above_boundary"] == 1),
+        ("metar_gap_c >= 0.25", rdf["metar_gap_c"] >= 0.25),
+        ("metar_gap_c >= 0.2 & nih==0", (rdf["metar_gap_c"] >= 0.2) & (rdf["naive_is_high"] == 0)),
+        ("single_peak==1 & nih==0", (rdf["single_reading_peak"] == 1) & (rdf["naive_is_high"] == 0)),
+        ("single_peak==1 & nih==1", (rdf["single_reading_peak"] == 1) & (rdf["naive_is_high"] == 1)),
+        ("vol_1hr<=0.5 & nih==0 & n_poss==2", (rdf["temp_f_volatility_1hr"] <= 0.5) & (rdf["naive_is_high"] == 0) & (rdf["n_possible_f"] == 2)),
+        ("vol_1hr<=0.5 & nih==1", (rdf["temp_f_volatility_1hr"] <= 0.5) & (rdf["naive_is_high"] == 1)),
+        ("consec>=30 & nih==0", (rdf["consec_count"] >= 30) & (rdf["naive_is_high"] == 0)),
+        ("gap_below==1", rdf["peak_edge_f_gap_below"] == 1),
+        ("gap_above==1", rdf["peak_edge_f_gap_above"] == 1),
+        ("metar_gap_c<=-0.5 & nih==1", (rdf["metar_gap_c"] <= -0.5) & (rdf["naive_is_high"] == 1)),
+        ("dwell>=20 & nih==0", (rdf["dwell_count"] >= 20) & (rdf["naive_is_high"] == 0)),
+        ("vol_1hr<=0.6 & nih==1", (rdf["temp_f_volatility_1hr"] <= 0.6) & (rdf["naive_is_high"] == 1)),
+        ("metar_confirm>=0.2 & nih==0", (rdf["metar_confirm"] >= 0.2) & (rdf["naive_is_high"] == 0)),
     ]
 
-    for name, mask, desc in rules:
+    for name, mask in rules:
         sub = rdf.loc[mask, "offset"]
         n_sub = len(sub)
         if n_sub == 0:
@@ -514,7 +625,33 @@ def deep_analysis(rdf: pd.DataFrame):
         pct_m1 = counts.get(-1, 0) / n_sub
         pct_0 = counts.get(0, 0) / n_sub
         pct_p1 = counts.get(1, 0) / n_sub
-        print(f"  {name:<45s} n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}  {desc}")
+        dominant = max((-1, pct_m1), (0, pct_0), (1, pct_p1), key=lambda x: x[1])
+        print(f"  {name:<45s} n={n_sub:>4d}  -1={pct_m1:5.1%}  0={pct_0:5.1%}  +1={pct_p1:5.1%}  dominant={dominant[0]:+d} ({dominant[1]:.1%})")
+
+    # --- Per-site breakdown of rules ---
+    # print("\n" + "=" * 90)
+    # print("PER-SITE RULE BREAKDOWN")
+    # print("=" * 90)
+
+    # all_sites = sorted(rdf["site"].unique())
+    # for name, mask in rules:
+    #     sub = rdf.loc[mask]
+    #     if len(sub) == 0:
+    #         continue
+    #     print(f"\n  {name}")
+    #     print(f"  {'Site':<8s} {'N':>5s}  {'off=-1':>7s} {'off=0':>7s} {'off=+1':>7s}  {'dominant':>10s}")
+    #     print(f"  {'-'*8} {'-'*5}  {'-'*7} {'-'*7} {'-'*7}  {'-'*10}")
+    #     for site in all_sites:
+    #         site_sub = sub[sub["site"] == site]["offset"]
+    #         ns = len(site_sub)
+    #         if ns == 0:
+    #             continue
+    #         sc = site_sub.value_counts()
+    #         pm1 = sc.get(-1, 0) / ns
+    #         p0 = sc.get(0, 0) / ns
+    #         pp1 = sc.get(1, 0) / ns
+    #         dom = max((-1, pm1), (0, p0), (1, pp1), key=lambda x: x[1])
+    #         print(f"  {site:<8s} {ns:5d}  {pm1:6.1%} {p0:6.1%} {pp1:6.1%}  {dom[0]:+d} ({dom[1]:.1%})")
 
     # --- Overlap analysis ---
     print("\n--- Overlap analysis ---")
@@ -528,6 +665,19 @@ def deep_analysis(rdf: pd.DataFrame):
 
 
 if __name__ == "__main__":
-    rdf = build_df()
+    import argparse
+    parser = argparse.ArgumentParser(description="EDA for structural offset rules")
+    parser.add_argument("--use-all-sites", action="store_true",
+                        help="Include training-only sites (default: Kalshi sites only)")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Filter to dates >= this (YYYY-MM-DD)")
+    args = parser.parse_args()
+
+    sites = list(ALL_SITES_WITH_TRAINING) if args.use_all_sites else None
+    rdf = build_df(sites)
+    if args.since:
+        rdf = rdf[rdf["date"] >= args.since].reset_index(drop=True)
+        print(f"  Filtered to dates >= {args.since}: {len(rdf)} rows")
+    rdf["max_c_mod5"] = rdf["max_c"].astype(int) % 5
     scan_features(rdf)
     deep_analysis(rdf)

@@ -156,17 +156,26 @@ def predict_settlement_from_obs(obs_df: pd.DataFrame) -> Optional[RoundingPredic
 def _rolling_mean(
     timestamps: pd.Series, values: pd.Series, window_min: int,
 ) -> list:
-    result = []
-    for i in range(len(timestamps)):
-        ts_i = timestamps.iloc[i]
-        cutoff = ts_i - pd.Timedelta(minutes=window_min)
-        mask = (timestamps >= cutoff) & (timestamps <= ts_i) & values.notna()
-        w = values[mask]
-        if len(w) < 2:
-            result.append(None)
-        else:
-            result.append(round(float(w.mean()), 2))
-    return result
+    """Time-based rolling mean using pandas .rolling() — O(n)."""
+    try:
+        idx = pd.DatetimeIndex(pd.to_datetime(timestamps))
+    except (ValueError, TypeError):
+        idx = pd.DatetimeIndex(pd.to_datetime(timestamps, utc=True))
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    s = pd.Series(values.values, index=idx, dtype=float)
+    needs_sort = not s.index.is_monotonic_increasing
+    if needs_sort:
+        orig_order = np.arange(len(s))
+        sort_idx = s.index.argsort()
+        s = s.iloc[sort_idx]
+    rolled = s.rolling(f"{window_min}min", min_periods=2).mean()
+    if needs_sort:
+        # Restore original order
+        unsort = np.empty_like(sort_idx)
+        unsort[sort_idx] = orig_order
+        rolled = rolled.iloc[unsort]
+    return [round(v, 2) if not np.isnan(v) else None for v in rolled.values]
 
 
 def compute_momentum(
@@ -187,7 +196,9 @@ def compute_momentum(
         return df
 
     df = df.copy()
-    timestamps = pd.to_datetime(df["timestamp"])
+    # Parse timestamps to naive datetime64 — strip tz if present
+    _raw = df["timestamp"].astype(str).str[:19]  # truncate tz offset
+    timestamps = pd.to_datetime(_raw)
     temps = df["temperature_f"].astype(float)
 
     ma_short_vals = _rolling_mean(timestamps, temps, ma_short_min)
@@ -200,34 +211,36 @@ def compute_momentum(
         for s, l in zip(ma_short_vals, ma_long_vals)
     ]
 
+    # Rate: OLS slope of ma_short over trailing window — vectorized
     rate_window = min(ma_short_min, 30)
-    ma_short_series = pd.Series(ma_short_vals, dtype=float)
-    rates = []
-    for i in range(len(df)):
-        ts_i = timestamps.iloc[i]
-        cutoff = ts_i - pd.Timedelta(minutes=rate_window)
-        mask = (timestamps >= cutoff) & (timestamps <= ts_i) & ma_short_series.notna()
-        w_ts = timestamps[mask]
-        w_vals = ma_short_series[mask]
-        if len(w_ts) < 2:
-            rates.append(None)
-            continue
-        t0 = w_ts.iloc[0]
-        x = np.array([(t - t0).total_seconds() / 3600.0 for t in w_ts])
-        y = np.array(w_vals)
-        if x[-1] - x[0] < 0.05:
-            rates.append(None)
+    ma_short_arr = np.array([v if v is not None else np.nan for v in ma_short_vals], dtype=float)
+    ts_seconds = (timestamps - timestamps.iloc[0]).dt.total_seconds().values.astype(float)
+    n = len(df)
+
+    # Convert window to approximate row count for fast slicing
+    # (data is ~5-min intervals but may vary; use time-based check)
+    rates = np.full(n, np.nan)
+    rate_window_sec = rate_window * 60.0
+    for i in range(n):
+        # Walk backward from i to find window start
+        j = i
+        while j > 0 and (ts_seconds[i] - ts_seconds[j - 1]) <= rate_window_sec:
+            j -= 1
+        x = ts_seconds[j:i + 1] / 3600.0  # hours
+        y = ma_short_arr[j:i + 1]
+        valid = ~np.isnan(y)
+        x = x[valid]
+        y = y[valid]
+        if len(x) < 2 or (x[-1] - x[0]) < 0.05:
             continue
         xm = x.mean()
         dx = x - xm
         denom = np.sum(dx ** 2)
         if denom == 0:
-            rates.append(None)
             continue
-        slope = np.sum(dx * (y - y.mean())) / denom
-        rates.append(round(float(slope), 2))
+        rates[i] = round(float(np.sum(dx * (y - y.mean())) / denom), 2)
 
-    df["rate_f_per_hr"] = rates
+    df["rate_f_per_hr"] = [None if np.isnan(r) else r for r in rates]
     df["rate_window_min"] = window_minutes
     return df
 
@@ -289,6 +302,9 @@ def plot_momentum(
     bracket_error: Optional[str] = None,
     peak_result: Optional[dict] = None,
     metar_6h_local_dt: Optional[object] = None,
+    true_max_f: Optional[float] = None,
+    cli_reports: Optional[list] = None,
+    dsm_reports: Optional[list] = None,
 ):
     """Plot temperature + MA crossover and save to file.
 
@@ -298,13 +314,22 @@ def plot_momentum(
     *peak_result*: dict from peak_model.predict() with keys
     ``probability``, ``prediction``, ``cur_naive_f``.
 
+    *true_max_f*: actual settlement high °F (e.g. from 24h ASOS max).
+    Drawn as a horizontal line for backtesting / historical review.
+
+    *cli_reports*: list of parsed CLI dicts from fetch_all_cli_today().
+    Each drawn as a horizontal line showing the reported high.
+
+    *dsm_reports*: list of parsed DSM dicts from fetch_dsm_today().
+
     Thread-safe: uses _plot_lock to serialize matplotlib calls.
     """
     with _plot_lock:
         _plot_momentum_impl(df, site, output, forecast_df,
                             locked_rate, likely_rate, margin_threshold,
                             sun_times, metar_6h_f, bracket, bracket_probs,
-                            bracket_error, peak_result, metar_6h_local_dt)
+                            bracket_error, peak_result, metar_6h_local_dt,
+                            true_max_f, cli_reports, dsm_reports)
 
 
 def _plot_momentum_impl(
@@ -322,6 +347,9 @@ def _plot_momentum_impl(
     bracket_error: Optional[str] = None,
     peak_result: Optional[dict] = None,
     metar_6h_local_dt: Optional[object] = None,
+    true_max_f: Optional[float] = None,
+    cli_reports: Optional[list] = None,
+    dsm_reports: Optional[list] = None,
 ):
     import matplotlib
     matplotlib.use("Agg")
@@ -382,8 +410,7 @@ def _plot_momentum_impl(
             peak_time = fc_ts[fc_max_idx]
             peak_lo = peak_time - np.timedelta64(30, 'm')
             peak_hi = peak_time + np.timedelta64(30, 'm')
-            ax1.axvspan(peak_lo, peak_hi, color="tab:purple", alpha=0.1,
-                        label="Forecast peak window")
+            ax1.axvspan(peak_lo, peak_hi, color="tab:purple", alpha=0.1)
             ax1.annotate(f"Fcst peak: {fc_temps[fc_max_idx]:.0f}°F",
                          xy=(peak_time, fc_temps[fc_max_idx]),
                          xytext=(-60, 15), textcoords="offset points",
@@ -395,8 +422,7 @@ def _plot_momentum_impl(
             low_time = fc_ts[fc_min_idx]
             low_lo = low_time - np.timedelta64(30, 'm')
             low_hi = low_time + np.timedelta64(30, 'm')
-            ax1.axvspan(low_lo, low_hi, color="tab:blue", alpha=0.08,
-                        label="Forecast low window")
+            ax1.axvspan(low_lo, low_hi, color="tab:blue", alpha=0.08)
             ax1.annotate(f"Fcst low: {fc_temps[fc_min_idx]:.0f}°F",
                          xy=(low_time, fc_temps[fc_min_idx]),
                          xytext=(10, -20), textcoords="offset points",
@@ -452,17 +478,215 @@ def _plot_momentum_impl(
                      fontsize=9, color="tab:blue",
                      arrowprops=dict(arrowstyle="->", color="tab:blue", alpha=0.7))
 
-    # METAR 6h max — most precise observation
+    # True settlement max (24h ASOS) — for historical review
+    if true_max_f is not None:
+        ax1.axhline(y=true_max_f, color="red", linestyle="-", alpha=0.7, linewidth=1.5,
+                     label=f"Settlement: {true_max_f:.0f}°F")
+
+    # METAR 6h max — most precise observation (passed in as single value)
     if metar_6h_f is not None:
         ax1.axhline(y=metar_6h_f, color="magenta", linestyle="-", alpha=0.6, linewidth=1.5,
                      label=f"METAR 6h max: {metar_6h_f:.1f}°F")
 
-    # METAR 6h report time — vertical line
-    if metar_6h_local_dt is not None:
+    # CLI reports — vertical line at publish time, star at max time
+    if cli_reports and len(timestamps) > 0:
+        from datetime import datetime as _dt
+        _today_date = pd.Timestamp(timestamps[-1]).normalize()
+        _cli_labeled = False
+        for cli in cli_reports:
+            _cli_f = cli.get("max_temp_f")
+            if _cli_f is None:
+                continue
+            _time_str = cli.get("max_temp_time", "")
+            _tag = "prelim" if cli.get("is_preliminary") else "final"
+
+            # Vertical line at issued/publish time
+            _issued = cli.get("issued", "")
+            if _issued:
+                try:
+                    import re as _re
+                    _im = _re.match(r"(\d{1,4})\s+([AP]M)", _issued)
+                    if _im:
+                        _raw = _im.group(1).zfill(4)
+                        _ih = int(_raw[:-2])
+                        _imin = int(_raw[-2:])
+                        _ampm = _im.group(2)
+                        if _ampm == "PM" and _ih != 12:
+                            _ih += 12
+                        elif _ampm == "AM" and _ih == 12:
+                            _ih = 0
+                        _pub_dt = _today_date + pd.Timedelta(hours=_ih, minutes=_imin)
+                        _lbl = f"CLI {_tag}: {_cli_f}°F" if not _cli_labeled else None
+                        for ax in (ax1, ax2):
+                            ax.axvline(_pub_dt, color="red", linestyle="-",
+                                       alpha=0.7, linewidth=1.5,
+                                       label=_lbl if ax is ax1 else None)
+                        _cli_labeled = True
+                except Exception:
+                    pass
+
+            # Star at max temp time
+            if _time_str:
+                try:
+                    _t = _time_str.strip()
+                    if ":" in _t:
+                        _parsed = _dt.strptime(_t, "%I:%M %p")
+                    else:
+                        _parsed = _dt.strptime(_t, "%I%M %p")
+                    _max_dt = _today_date + pd.Timedelta(hours=_parsed.hour, minutes=_parsed.minute)
+                    ax1.scatter([_max_dt], [_cli_f + 0.3], color="#FF4444", marker="*",
+                                s=150, zorder=7, edgecolors="darkred", linewidths=0.5)
+                    ax1.annotate(f"CLI {_cli_f}°F", xy=(_max_dt, _cli_f + 0.3), xytext=(5, 8),
+                                 textcoords="offset points", fontsize=7,
+                                 color="#CC0000", fontweight="bold")
+                except (ValueError, IndexError):
+                    pass
+
+    # DSM reports — scatter points at max time + vertical lines at publish time
+    if dsm_reports and len(timestamps) > 0:
+        _today_date = pd.Timestamp(timestamps[-1]).normalize()
+        _dsm_labeled = False
+        for dsm in dsm_reports:
+            _dsm_f = dsm.get("max_temp_f")
+            if _dsm_f is None:
+                continue
+            _time_str = dsm.get("max_temp_time", "")  # local HH:MM
+            _utc_str = dsm.get("obs_time_utc", "")    # UTC HHMM
+
+            # Vertical line at DSM publish time (use 'entered' field, not obs_time_utc)
+            _entered = dsm.get("entered", "")
+            if _entered:
+                try:
+                    from zoneinfo import ZoneInfo as _ZI
+                    from weather.sites import FORECAST_STATIONS
+                    _coords = FORECAST_STATIONS.get(site)
+                    if _coords:
+                        _tz = _ZI(_coords[2])
+                        _entered_utc = pd.to_datetime(_entered)
+                        if _entered_utc.tzinfo is None:
+                            _entered_utc = _entered_utc.tz_localize("UTC")
+                        _entered_local = _entered_utc.tz_convert(_tz)
+                        _pub_naive = _entered_local.tz_localize(None)
+                        _lbl = f"DSM: {_dsm_f}°F" if not _dsm_labeled else None
+                        for ax in (ax1, ax2):
+                            ax.axvline(_pub_naive, color="#44AAFF", linestyle="-",
+                                       alpha=0.7, linewidth=1.5,
+                                       label=_lbl if ax is ax1 else None)
+                        _dsm_labeled = True
+                except Exception:
+                    pass
+
+            # Star at max temp time
+            if _time_str:
+                try:
+                    _parts = _time_str.split(":")
+                    _h, _m = int(_parts[0]), int(_parts[1])
+                    _max_dt = _today_date + pd.Timedelta(hours=_h, minutes=_m)
+                    ax1.scatter([_max_dt], [_dsm_f - 0.3], color="#44AAFF", marker="*",
+                                s=120, zorder=6, edgecolors="#0066CC", linewidths=0.5)
+                    ax1.annotate(f"DSM {_dsm_f}°F", xy=(_max_dt, _dsm_f - 0.3), xytext=(5, -12),
+                                 textcoords="offset points", fontsize=7,
+                                 color="#0066CC", fontweight="bold")
+                except (ValueError, IndexError):
+                    pass
+
+    # Projected CLI drop times from sites.yaml
+    if len(timestamps) > 0:
+        try:
+            from weather.sites import get_site_config
+            _cfg = get_site_config(site)
+            _obs_date = pd.Timestamp(timestamps[-1]).normalize()
+            for _key, _color, _lbl_pfx in [
+                ("cli_prelim_local", "red", "CLI prelim"),
+                ("cli_final_local", "red", "CLI final"),
+            ]:
+                _time_str = _cfg.get(_key)
+                if _time_str:
+                    _h, _m = int(_time_str.split(":")[0]), int(_time_str.split(":")[1])
+                    _day = _obs_date if _h >= 12 else _obs_date + pd.Timedelta(days=1)
+                    _proj_dt = _day + pd.Timedelta(hours=_h, minutes=_m)
+                    for ax in (ax1, ax2):
+                        ax.axvline(_proj_dt, color=_color, linestyle=":",
+                                   alpha=0.35, linewidth=1)
+        except Exception:
+            pass
+
+    # Projected 6h METAR report times — vertical lines for all 4 daily windows
+    # Always compute from UTC schedule so all 4 times show (not just reported ones)
+    _metar_6h_times_plotted = False
+    if len(timestamps) > 0:
+        _today_date = pd.Timestamp(timestamps[-1]).normalize()
+        _m6h_times = []  # list of (local_datetime, reported_bool)
+        try:
+            from weather.sites import FORECAST_STATIONS
+            from zoneinfo import ZoneInfo as _ZI
+            from datetime import datetime as _dt
+            coords = FORECAST_STATIONS.get(site)
+            if coords:
+                _tz = _ZI(coords[2])
+                # Which hours have already reported?
+                _reported_hours = set()
+                if "max_temp_6h_f" in df.columns:
+                    _m6h_rows = df[df["max_temp_6h_f"].notna()]
+                    if not _m6h_rows.empty:
+                        _reported_hours = set(pd.to_datetime(
+                            _m6h_rows["timestamp"].str[:19]).dt.hour)
+                for _uh in [0, 6, 12, 18]:
+                    _utc = _dt(_today_date.year, _today_date.month, _today_date.day,
+                               _uh, 53, tzinfo=_ZI("UTC"))
+                    _local = _utc.astimezone(_tz)
+                    _local_naive = pd.Timestamp(_local).tz_localize(None)
+                    _reported = _local.hour in _reported_hours
+                    _m6h_times.append((_local_naive, _reported))
+        except Exception:
+            pass
+        if _m6h_times:
+            for _mdt, _reported in _m6h_times:
+                _alpha = 0.7 if _reported else 0.4
+                _ls = "--" if _reported else ":"
+                for ax in (ax1, ax2):
+                    ax.axvline(_mdt, color="magenta", linestyle=_ls,
+                               alpha=_alpha, linewidth=1.2)
+            _metar_6h_times_plotted = True
+            _sun_markers.append((_m6h_times[0][0], "magenta", "6h METAR windows"))
+
+            # Projected DSM drop times from sites.yaml
+            try:
+                from weather.sites import get_site_config as _gsc
+                _dsm_times = _gsc(site).get("dsm_drop_local", [])
+                for _dt_str in _dsm_times:
+                    _dh, _dm = int(_dt_str.split(":")[0]), int(_dt_str.split(":")[1])
+                    _dsm_proj = _today_date + pd.Timedelta(hours=_dh, minutes=_dm)
+                    for ax in (ax1, ax2):
+                        ax.axvline(_dsm_proj, color="#44AAFF", linestyle=":",
+                                   alpha=0.3, linewidth=0.8)
+            except Exception:
+                pass
+
+    # Legacy single METAR line (only if projected times not shown)
+    if not _metar_6h_times_plotted and metar_6h_local_dt is not None:
         metar_dt = pd.Timestamp(metar_6h_local_dt).tz_localize(None)
         for ax in (ax1, ax2):
             ax.axvline(metar_dt, color="magenta", linestyle="--", alpha=0.5, linewidth=1)
         _sun_markers.append((metar_dt, "magenta", "6h METAR"))
+
+    # All 6h METAR observations from the data (max and min)
+    if "max_temp_6h_f" in df.columns:
+        metar_6h_rows = df[df["max_temp_6h_f"].notna()]
+        # Skip early 6h METAR (before 02:00) — it reports yesterday's max
+        if not metar_6h_rows.empty:
+            _m6h_ts = pd.to_datetime(metar_6h_rows["timestamp"].str[:19])
+            metar_6h_rows = metar_6h_rows[_m6h_ts.dt.hour >= 2]
+        if not metar_6h_rows.empty:
+            m_ts = pd.to_datetime(metar_6h_rows["timestamp"].str[:19]).values
+            m_vals = metar_6h_rows["max_temp_6h_f"].to_numpy(dtype=float)
+            ax1.scatter(m_ts, m_vals, color="magenta", marker="D", s=50,
+                        zorder=5, edgecolors="white", linewidths=0.5,
+                        label=f"6h METAR max ({len(m_vals)})")
+            for t, v in zip(m_ts, m_vals):
+                ax1.annotate(f"{v:.1f}", xy=(t, v), xytext=(5, 8),
+                             textcoords="offset points", fontsize=7,
+                             color="magenta", fontweight="bold")
 
     # Predicted bracket — shaded band (clamp sentinels to visible range)
     if bracket and len(bracket) == 2:
@@ -519,9 +743,28 @@ def _plot_momentum_impl(
     if has_bracket_info:
         # Extract offset detail from first result (same for all brackets)
         od = bracket_probs[0].get("offset_detail") if bracket_probs else None
-        # Current max °F from observations
-        cur_max_f = int(round(float(df["temperature_f"].max())))
-        lines = [f"Bracket Model — Current max: {cur_max_f}°F"]
+        # Current auto max °F (whole-degree C readings only, excludes METAR)
+        tc = pd.to_numeric(df.get("temperature_c"), errors="coerce")
+        auto_mask = (tc % 1 == 0) & tc.notna()
+        if auto_mask.any():
+            auto_max_c = int(round(tc[auto_mask].max()))
+            cur_max_f = round(auto_max_c * 9.0 / 5.0 + 32.0)
+        else:
+            cur_max_f = int(round(float(df["temperature_f"].max())))
+        # Rounding context: possible °F values and naive_is_high
+        _possible_f = c_to_possible_f(auto_max_c) if auto_mask.any() else []
+        _naive_is_high = (len(_possible_f) == 2 and cur_max_f == _possible_f[-1])
+        _n_poss = len(_possible_f)
+        if _n_poss == 1:
+            _rounding_note = f"exact (only {_possible_f[0]}°F maps to {auto_max_c}°C)"
+        elif _naive_is_high:
+            _rounding_note = (f"rounds to {_possible_f[1]}°F (high) — "
+                              f"likely settles down to {_possible_f[0]}°F")
+        else:
+            _rounding_note = (f"rounds to {_possible_f[0]}°F (low) — "
+                              f"may settle up to {_possible_f[1]}°F")
+        lines = [f"Bracket Model — Auto max: {cur_max_f}°F ({auto_max_c if auto_mask.any() else '?'}°C)  "
+                 f"| {_rounding_note}"]
         if od:
             s1 = od["stage1"]
             s2 = od["stage2"]
@@ -557,12 +800,14 @@ def _plot_momentum_impl(
     # Peak model prediction — bottom right
     if peak_result is not None:
         prob = peak_result["probability"]
+        prob_2f = peak_result.get("probability_2f", 0.0)
         naive_f = peak_result["cur_naive_f"]
         verdict = "YES" if peak_result["prediction"] else "NO"
+        verdict_2f = "YES" if peak_result.get("prediction_2f") else "NO"
         color = "limegreen" if prob < 0.3 else ("orange" if prob < 0.7 else "tomato")
-        peak_text = (f"Peak Model: +1°F?\n"
-                     f"  Current: {naive_f}°F\n"
-                     f"  P(increase): {prob:.0%}  → {verdict}")
+        peak_text = (f"Peak Model — Current: {naive_f}°F\n"
+                     f"  P(>1°F): {prob:.0%}  → {verdict}\n"
+                     f"  P(>2°F): {prob_2f:.0%}  → {verdict_2f}")
         fig.text(0.98, 0.005, peak_text, fontsize=8, fontfamily="monospace",
                  va="bottom", ha="right",
                  bbox=dict(boxstyle="round,pad=0.4", facecolor=color, alpha=0.25))
@@ -698,33 +943,84 @@ def main():
     except Exception as e:
         print(f"Could not fetch sun times: {e}")
 
-    # METAR 6h report time
-    metar_6h_local_dt = None
+    # 6h METAR max
+    metar_6h_f = None
+    if "max_temp_6h_f" in df.columns:
+        m6h = pd.to_numeric(df["max_temp_6h_f"], errors="coerce").dropna()
+        if not m6h.empty:
+            metar_6h_f = float(m6h.max())
+
+    # Bracket model
+    bracket = None
+    bracket_probs = None
+    bracket_error = None
     try:
-        from weather.sites import get_site_config
-        site_cfg = get_site_config(args.site)
-        metar_utc_str = site_cfg.get("metar_6h_utc")
-        if metar_utc_str and coords:
-            from zoneinfo import ZoneInfo as _ZI2
-            _stz = _ZI2(coords[2])
-            _today = _dt.now(_stz).date()
-            _hh, _mm = int(metar_utc_str.split(":")[0]), int(metar_utc_str.split(":")[1])
-            metar_utc_dt = _dt(_today.year, _today.month, _today.day, _hh, _mm, tzinfo=_ZI2("UTC"))
-            metar_6h_local_dt = metar_utc_dt.astimezone(_stz)
+        from weather.bracket_model import load_model as _load_bm, get_probability as _get_prob
+        from weather.backtest_rounding import extract_regression_features as _extract_rf
+        _sn = sun_times.get("solar_noon") if sun_times else None
+        _feats = _extract_rf(df, solar_noon_hour=_sn)
+        if _feats is not None:
+            _bmodel = _load_bm()
+            _max_c = _feats.get("max_c")
+            if _max_c is not None:
+                _nf = round(float(_max_c) * 9.0 / 5.0 + 32.0)
+                _cl = _nf if _nf % 2 == 0 else _nf - 1
+                _btuples = [(_lo, _lo + 1) for _lo in [_cl - 4, _cl - 2, _cl, _cl + 2, _cl + 4]]
+                bracket_probs = _get_prob(_bmodel, _feats, _btuples, metar_6h_f=metar_6h_f)
+                bracket_probs = [bp for bp in bracket_probs if bp["prob"] >= 0.005]
+                bracket_probs.sort(key=lambda x: -x["prob"])
+                if bracket_probs:
+                    bracket = list(bracket_probs[0]["bracket"])
     except Exception as e:
-        print(f"Could not compute METAR 6h time: {e}")
+        bracket_error = str(e)
+
+    # Peak model
+    peak_result = None
+    try:
+        from weather.peak_model import load_model as _load_pm, predict as _peak_predict
+        _pb = _load_pm()
+        _fh = forecast_df["temperature_f"].max() if forecast_df is not None and not forecast_df.empty else 70.0
+        _sn_h = sun_times.get("solar_noon", 12.0) if sun_times else 12.0
+        peak_result = _peak_predict(_pb, df, forecast_high_f=float(_fh), solar_noon_hour=_sn_h)
+    except Exception as e:
+        print(f"Peak model: {e}")
+
+    # CLI reports
+    cli_reports = None
+    try:
+        from weather.observations import fetch_all_cli_today
+        cli_reports = fetch_all_cli_today(args.site)
+        if cli_reports:
+            print(f"CLI reports: {len(cli_reports)}")
+        else:
+            print("CLI: no reports found")
+    except Exception as e:
+        print(f"CLI fetch error: {e}")
+
+    # DSM reports
+    dsm_reports = None
+    try:
+        from weather.observations import fetch_dsm_today
+        dsm_reports = fetch_dsm_today(args.site)
+        if dsm_reports:
+            print(f"DSM reports: {len(dsm_reports)}")
+    except Exception:
+        pass
 
     # Plot
     try:
         from bot.app import MOMENTUM_PARAMS_FAST, MOMENTUM_PARAMS_WIDE
-        lr = MOMENTUM_PARAMS_FAST[0]   # cross threshold for FAST
-        mt = MOMENTUM_PARAMS_FAST[1]   # margin for FAST
-        ll = MOMENTUM_PARAMS_WIDE[0]   # cross threshold for WIDE
+        lr = MOMENTUM_PARAMS_FAST[0]
+        mt = MOMENTUM_PARAMS_FAST[1]
+        ll = MOMENTUM_PARAMS_WIDE[0]
     except ImportError:
         lr, mt, ll = -0.5, 2.0, -0.2
     plot_momentum(df, args.site, output=args.output, forecast_df=forecast_df,
                   locked_rate=lr, likely_rate=ll, margin_threshold=mt,
-                  sun_times=sun_times, metar_6h_local_dt=metar_6h_local_dt)
+                  sun_times=sun_times, metar_6h_f=metar_6h_f,
+                  bracket=bracket, bracket_probs=bracket_probs,
+                  bracket_error=bracket_error, peak_result=peak_result,
+                  cli_reports=cli_reports, dsm_reports=dsm_reports)
 
     # Optional CSV
     if args.csv:

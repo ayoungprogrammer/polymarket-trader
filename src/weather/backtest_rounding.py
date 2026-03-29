@@ -24,7 +24,8 @@ from typing import Optional, List, Dict, Tuple
 import numpy as np
 import pandas as pd
 
-from weather.backtest import load_site_history, ALL_SITES
+from weather.backtest import load_site_history
+from weather.sites import ALL_SITES, ALL_SITES_WITH_TRAINING, TRAINING_SITES
 from weather.prediction import (
     c_to_possible_f,
     RoundingPrediction,
@@ -33,7 +34,7 @@ from weather.prediction import (
 
 from paths import project_path
 
-SOLAR_NOON_CSV = project_path("data", "solar_noon.csv")
+SOLAR_NOON_CSV = project_path("data", "weather", "solar_noon.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -124,15 +125,16 @@ def evaluate_day(day_df: pd.DataFrame) -> Optional[dict]:
         low_f = f_low
         high_f = f_high + 1
 
-    # True daily high: prefer 24h ASOS max (settlement-grade), fall back to obs max
-    all_temps_f = df["temperature_f"].dropna()
-    if all_temps_f.empty:
-        return None
-    actual_max_f = round(float(all_temps_f.max()))
-    if "max_temp_24h_f" in df.columns:
-        val_24h = pd.to_numeric(df["max_temp_24h_f"], errors="coerce").max()
-        if not np.isnan(val_24h):
-            actual_max_f = round(float(val_24h))
+    # True daily high from 6h METARs (settlement-grade, correctly day-scoped)
+    # Skip any 6h METAR before 01:00 — it covers the previous evening window
+    if "max_temp_6h_f" not in df.columns:
+        raise ValueError("max_temp_6h_f column missing — re-fetch history data")
+    _m6h = df[["ts", "max_temp_6h_f"]].copy()
+    _m6h["max_temp_6h_f"] = pd.to_numeric(_m6h["max_temp_6h_f"], errors="coerce")
+    _m6h = _m6h[(_m6h["max_temp_6h_f"].notna()) & (_m6h["ts"].dt.hour >= 1)]
+    if _m6h.empty:
+        return None  # no daytime 6h METAR readings this day
+    actual_max_f = round(float(_m6h["max_temp_6h_f"].max()))
 
     return {
         "max_c_obs": max_c,
@@ -419,7 +421,7 @@ def run_backtest(sites: Optional[List[str]] = None):
     # Save results
     import json
     from paths import project_path
-    out_path = project_path("data", "backtest_rounding_results.json")
+    out_path = project_path("data", "weather", "backtest_rounding_results.json")
     output = {
         "summary": {
             "total_days": total_days,
@@ -457,6 +459,10 @@ _MET_FEATURE_NAMES = [
     "wind_at_peak", "wind_pre_peak", "wind_calm_frac",
     "wind_gust_range", "wind_change_at_peak",
     "rh_at_peak", "rh_min_near_peak",
+    "dewpoint_at_peak", "dewpoint_depression_at_peak", "dewpoint_change_near_peak",
+    "heat_index_at_peak", "heat_index_excess",
+    "pressure_at_peak", "pressure_change_near_peak", "pressure_tendency_at_peak",
+    "cloud_cover_at_peak", "cloud_variability",
 ]
 
 
@@ -525,6 +531,95 @@ def _met_features(
     rh_near = rh[near_start:near_end]
     rh_min_near_peak = float(np.nanmin(rh_near)) if len(rh_near) > 0 and np.any(~np.isnan(rh_near)) else np.nan
 
+    # --- Category C: Dewpoint ---
+    dp = pd.to_numeric(day_df.get("dewpoint_c"), errors="coerce").values if "dewpoint_c" in day_df.columns else np.full(n, np.nan)
+    temp_c_all = pd.to_numeric(day_df.get("temperature_c"), errors="coerce").values if "temperature_c" in day_df.columns else np.full(n, np.nan)
+
+    dp_peak = dp[peak_df_idxs]
+    dewpoint_at_peak = float(np.nanmean(dp_peak)) if np.any(~np.isnan(dp_peak)) else np.nan
+
+    # Dewpoint depression = temp - dewpoint (larger = drier air)
+    temp_at_peak_vals = temp_c_all[peak_df_idxs]
+    if np.any(~np.isnan(dp_peak)) and np.any(~np.isnan(temp_at_peak_vals)):
+        dewpoint_depression_at_peak = float(np.nanmean(temp_at_peak_vals - dp_peak))
+    else:
+        dewpoint_depression_at_peak = np.nan
+
+    # Dewpoint change near peak (trend: rising dp = moisture advection)
+    dp_near = dp[near_start:near_end]
+    dp_near_valid = dp_near[~np.isnan(dp_near)]
+    if len(dp_near_valid) >= 2:
+        dewpoint_change_near_peak = float(dp_near_valid[-1] - dp_near_valid[0])
+    else:
+        dewpoint_change_near_peak = np.nan
+
+    # --- Category D: Heat index (Rothfusz regression, NWS formula) ---
+    # Only defined for T >= 80°F and RH >= 40%; NaN otherwise.
+    temp_f_peak = temp_at_peak_vals * 9.0 / 5.0 + 32.0 if temp_c_all is not None else np.full(len(peak_df_idxs), np.nan)
+    rh_peak_vals = rh[peak_df_idxs]
+    t_f = float(np.nanmean(temp_f_peak))
+    r_h = float(np.nanmean(rh_peak_vals))
+    if not np.isnan(t_f) and not np.isnan(r_h) and t_f >= 80.0 and r_h >= 40.0:
+        # Rothfusz regression
+        hi = (-42.379
+              + 2.04901523 * t_f
+              + 10.14333127 * r_h
+              - 0.22475541 * t_f * r_h
+              - 0.00683783 * t_f ** 2
+              - 0.05481717 * r_h ** 2
+              + 0.00122874 * t_f ** 2 * r_h
+              + 0.00085282 * t_f * r_h ** 2
+              - 0.00000199 * t_f ** 2 * r_h ** 2)
+        heat_index_at_peak = hi
+        heat_index_excess = hi - t_f  # how much hotter it "feels"
+    else:
+        heat_index_at_peak = np.nan
+        heat_index_excess = np.nan
+
+    # --- Category E: Pressure ---
+    slp = pd.to_numeric(day_df.get("sea_level_pressure"), errors="coerce").values if "sea_level_pressure" in day_df.columns else np.full(n, np.nan)
+    ptend = pd.to_numeric(day_df.get("pressure_tendency"), errors="coerce").values if "pressure_tendency" in day_df.columns else np.full(n, np.nan)
+
+    slp_peak = slp[peak_df_idxs]
+    pressure_at_peak = float(np.nanmean(slp_peak)) if np.any(~np.isnan(slp_peak)) else np.nan
+
+    # Pressure change in near-peak window (falling = approaching front)
+    slp_near = slp[near_start:near_end]
+    slp_near_valid = slp_near[~np.isnan(slp_near)]
+    if len(slp_near_valid) >= 2:
+        pressure_change_near_peak = float(slp_near_valid[-1] - slp_near_valid[0])
+    else:
+        pressure_change_near_peak = np.nan
+
+    ptend_peak = ptend[peak_df_idxs]
+    pressure_tendency_at_peak = float(np.nanmean(ptend_peak)) if np.any(~np.isnan(ptend_peak)) else np.nan
+
+    # --- Category F: Cloud cover ---
+    # cloud_layer_code is a string like "CLR", "FEW", "SCT", "BKN", "OVC"
+    # Encode as ordinal: CLR=0, FEW=1, SCT=2, BKN=3, OVC=4
+    cloud_order = {"CLR": 0, "FEW": 1, "SCT": 2, "BKN": 3, "OVC": 4}
+    if "cloud_layer_code" in day_df.columns:
+        cloud_raw = day_df["cloud_layer_code"].values
+        cloud_vals = np.array([cloud_order.get(str(v).strip().upper()[:3], np.nan) for v in cloud_raw])
+    else:
+        cloud_vals = np.full(n, np.nan)
+
+    cloud_near_peak = cloud_vals[near_start:near_end]
+    cloud_near_peak_valid = cloud_near_peak[~np.isnan(cloud_near_peak)]
+    if len(cloud_near_peak_valid) > 0:
+        # Mode: most frequent cloud cover code near peak
+        vals, counts = np.unique(cloud_near_peak_valid.astype(int), return_counts=True)
+        cloud_cover_at_peak = float(vals[np.argmax(counts)])
+    else:
+        cloud_cover_at_peak = np.nan
+
+    cloud_near = cloud_vals[near_start:near_end]
+    cloud_near_valid = cloud_near[~np.isnan(cloud_near)]
+    if len(cloud_near_valid) >= 2:
+        cloud_variability = float(np.std(cloud_near_valid))
+    else:
+        cloud_variability = np.nan
+
     return {
         "wind_at_peak": wind_at_peak,
         "wind_pre_peak": wind_pre_peak,
@@ -533,6 +628,16 @@ def _met_features(
         "wind_change_at_peak": wind_change_at_peak,
         "rh_at_peak": rh_at_peak,
         "rh_min_near_peak": rh_min_near_peak,
+        "dewpoint_at_peak": dewpoint_at_peak,
+        "dewpoint_depression_at_peak": dewpoint_depression_at_peak,
+        "dewpoint_change_near_peak": dewpoint_change_near_peak,
+        "heat_index_at_peak": heat_index_at_peak,
+        "heat_index_excess": heat_index_excess,
+        "pressure_at_peak": pressure_at_peak,
+        "pressure_change_near_peak": pressure_change_near_peak,
+        "pressure_tendency_at_peak": pressure_tendency_at_peak,
+        "cloud_cover_at_peak": cloud_cover_at_peak,
+        "cloud_variability": cloud_variability,
     }
 
 
@@ -562,13 +667,13 @@ def _extract_auto_metar(day_df: pd.DataFrame):
     metar_c = tc[metar_mask].values.astype(float)
     metar_ts = ts[metar_mask].values
 
-    # True daily high: prefer 24h ASOS max (settlement-grade), fall back to obs max
-    all_tf = df["temperature_f"].dropna()
-    actual_max_f = round(float(all_tf.max())) if len(all_tf) > 0 else None
-    if actual_max_f is not None and "max_temp_24h_f" in df.columns:
-        val_24h = pd.to_numeric(df["max_temp_24h_f"], errors="coerce").max()
-        if not np.isnan(val_24h):
-            actual_max_f = round(float(val_24h))
+    # True daily high from 6h METARs (settlement-grade, correctly day-scoped)
+    # Skip any 6h METAR before 01:00 — it covers the previous evening window
+    if "max_temp_6h_f" not in df.columns:
+        raise ValueError("max_temp_6h_f column missing — re-fetch history data")
+    _m6h_mask = df["max_temp_6h_f"].notna() & (ts.dt.hour >= 1)
+    _m6h_vals = pd.to_numeric(df.loc[_m6h_mask, "max_temp_6h_f"], errors="coerce")
+    actual_max_f = round(float(_m6h_vals.max())) if not _m6h_vals.empty else None
 
     return auto_c, auto_ts, metar_c, metar_ts, actual_max_f
 
@@ -1230,6 +1335,26 @@ def extract_regression_features(
     else:
         max_minus_ma15 = 0.0
 
+    # Max jump between consecutive readings within ±1hr of peak
+    jump_start = max(0, first_max_idx - 12)
+    jump_end = min(n_auto, last_max_idx + 13)
+    jump_window = ac[jump_start:jump_end]
+    if len(jump_window) >= 2:
+        max_jump_near_peak = float(np.max(np.abs(np.diff(jump_window))))
+    else:
+        max_jump_near_peak = 0.0
+
+    # Did any consecutive auto obs jump ≥2°F to the current auto max °F?
+    # Signals a transient spike rather than sustained climb.
+    has_2f_jump_to_peak = 0.0
+    if n_auto >= 2:
+        auto_f = np.round(ac * 9.0 / 5.0 + 32.0).astype(int)
+        max_f = int(auto_f.max())
+        for j in range(1, n_auto):
+            if auto_f[j] >= max_f and auto_f[j] - auto_f[j - 1] >= 2:
+                has_2f_jump_to_peak = 1.0
+                break
+
     # --- Rounding gap at peak edge -------------------------------------------
     # Does dropping from max_c to max_c-1 cause a 2°F shift in settlement?
     # e.g. 27°C→81°F, 26°C→79°F = 2°F gap. This makes the peak fragile:
@@ -1270,6 +1395,7 @@ def extract_regression_features(
         # --- Baseline ---
         "naive_f_float": naive_f_float,              # max_c converted to °F (fractional)
         "max_c": float(max_c),                       # highest whole-°C auto reading
+        "max_c_mod5": float(max_c % 5),              # 5°C cycle position (rounding pattern)
         "dwell_count": dwell_count,                   # readings at max_c
         "trans_count": trans_count,                   # readings at max_c - 1
         "consec_count": consec_count,                 # longest consecutive run at max_c
@@ -1352,6 +1478,8 @@ def extract_regression_features(
         "temp_f_mean_abs_diff": temp_f_mean_abs_diff,
         "temp_f_mean_abs_diff_30m": temp_f_mean_abs_diff_30m,
         "sub_hour_oscillation_rate": sub_hour_oscillation_rate,
+        "max_jump_near_peak": max_jump_near_peak,
+        "has_2f_jump_to_peak": has_2f_jump_to_peak,   # 1.0 if consecutive auto obs jumped ≥2°F to max °F
         "max_minus_ma15": max_minus_ma15,
         "max_minus_ma30": max_minus_ma30,
         "max_minus_ma60": max_minus_ma60,
@@ -1371,7 +1499,7 @@ def extract_regression_features(
 
 # Auto-obs only features (no METAR data).  Used as stage-1 model inputs;
 # predicted probabilities feed into the combined model.
-AUTO_FEATURE_COLS = [
+FEATURE_COLS = [
     # --- Rounding boundary ---
     "c_to_f_frac", "boundary_distance", "naive_is_high", "n_possible_f",
     "frac_x_dwell", "frac_x_consec",
@@ -1401,8 +1529,13 @@ AUTO_FEATURE_COLS = [
     "wind_at_peak", "wind_calm_frac",
     "wind_gust_range",
     "rh_at_peak", "rh_min_near_peak",
+    "dewpoint_at_peak", "dewpoint_depression_at_peak", "dewpoint_change_near_peak",
+    "heat_index_at_peak", "heat_index_excess",
+    "pressure_at_peak", "pressure_change_near_peak", "pressure_tendency_at_peak",
+    "cloud_cover_at_peak", "cloud_variability",
+    # --- Absolute temperature ---
+    "max_c", "max_c_mod5",
     # --- Temporal ---
-    "day_of_year_sin", "day_of_year_cos",
     "solar_noon", "peak_minus_solar_noon",
     # --- Volatility ---
     "temp_f_volatility_30m", "temp_f_volatility_1hr", "temp_f_volatility_2hr",
@@ -1410,15 +1543,21 @@ AUTO_FEATURE_COLS = [
     "temp_f_iqr_1hr", "temp_f_iqr_2hr",
     "temp_f_mean_abs_diff", "temp_f_mean_abs_diff_30m",
     "sub_hour_oscillation_rate",
+    "max_jump_near_peak",
+    "has_2f_jump_to_peak",
     "max_minus_ma15", "max_minus_ma30", "max_minus_ma60",
     # --- Peak edge rounding ---
     "peak_edge_f_gap_below",
     "peak_edge_f_gap_above",
     "dist_c_to_next_f",
     "dist_c_to_prev_f",
+    # --- METAR-derived (T-group precision) ---
+    "has_metar", "metar_above_boundary", "metar_boundary_margin_c",
+    "metar_gap_c", "metar_mean_gap_c", "metar_n_above",
+    "metar_confirm", "peak_lag_min",
+    "frac_x_metar_confirm",
 ]
 
-# METAR-derived features (require T-group precision readings).
 METAR_FEATURE_COLS = [
     "has_metar", "metar_above_boundary", "metar_boundary_margin_c",
     "metar_gap_c", "metar_mean_gap_c", "metar_n_above",
@@ -1426,34 +1565,18 @@ METAR_FEATURE_COLS = [
     "frac_x_metar_confirm",
 ]
 
-# Combined feature set for the final model (auto + METAR + stacked auto-model
-# probabilities).  The stacked columns (auto_prob_minus1, auto_prob_0,
-# auto_prob_plus1) are added dynamically in backtest_regression().
-FEATURE_COLS = AUTO_FEATURE_COLS + METAR_FEATURE_COLS
+DOY_COLS = ["day_of_year_sin", "day_of_year_cos"]
+
+FORECAST_COLS = ["yest_high_vs_naive_f", "forecast_vs_naive_f"]
+
+AUTO_FEATURE_COLS = [c for c in FEATURE_COLS if c not in METAR_FEATURE_COLS]
 
 
-def backtest_regression(sites: Optional[List[str]] = None,
-                        bracket_mode: Optional[str] = None):
-    """Train classification models to predict settlement offset {-1, 0, +1}.
-
-    Offset = actual_max_f - naive_f (clamped to [-1, +1]).
-    Drops absolute-temp features (naive_f_float, max_c) and uses peak shape,
-    momentum, and c_to_f_frac (rounding boundary proximity) only.
-
-    bracket_mode:
-      None     — 3-class offset {-1, 0, +1} (default)
-      "upper"  — binary: YES (offset >= 0) vs NO (offset = -1)
-                 Bracket is [naive_f, naive_f+1].
-      "middle" — binary: upper bracket (offset = +1) vs lower bracket (offset <= 0)
-                 Lower bracket [naive_f-1, naive_f], upper [naive_f+1, naive_f+2].
-    """
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.model_selection import cross_val_predict, StratifiedKFold
-    from sklearn.metrics import (
-        accuracy_score, classification_report, confusion_matrix,
-    )
+def tune_histgbm(sites: Optional[List[str]] = None, since: Optional[str] = None):
+    """Grid search HistGradientBoostingClassifier hyperparameters."""
+    from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.model_selection import GridSearchCV, StratifiedKFold
 
     if sites is None:
         sites = ALL_SITES
@@ -1464,9 +1587,6 @@ def backtest_regression(sites: Optional[List[str]] = None,
         sn_df = pd.read_csv(SOLAR_NOON_CSV)
         for _, row in sn_df.iterrows():
             solar_noon_lookup[(row["site"], str(row["date"]))] = float(row["solar_noon_hour"])
-        print(f"  Loaded {len(solar_noon_lookup)} solar noon entries from cache")
-    else:
-        print(f"  No solar noon cache found — using fallback (12.0)")
 
     # --- Collect features ----------------------------------------------------
     rows: List[dict] = []
@@ -1487,365 +1607,593 @@ def backtest_regression(sites: Optional[List[str]] = None,
             rows.append(feats)
 
     rdf = pd.DataFrame(rows)
+    if since:
+        rdf = rdf[rdf["date"] >= since].reset_index(drop=True)
+        print(f"  Filtered to dates >= {since}: {len(rdf)} rows")
+    feature_cols = list(AUTO_FEATURE_COLS)
+    required_cols = [c for c in feature_cols if c not in _MET_FEATURE_NAMES]
+    feature_mask = rdf[required_cols].notna().all(axis=1)
+    rdf = rdf[feature_mask].reset_index(drop=True)
     n = len(rdf)
 
-    # --- Solar noon coverage ---------------------------------------------------
+    X = rdf[feature_cols].values
+    y = rdf["offset"].values.astype(int)
+
+    print("=" * 78)
+    print(f"  HISTGBM HYPERPARAMETER TUNING ({n} rows, {len(feature_cols)} features)")
+    print("=" * 78)
+
+    param_grid = {
+        "max_iter": [100, 200, 400],
+        "max_depth": [5, 7, 9, 12],
+        "learning_rate": [0.05, 0.1, 0.2],
+        "min_samples_leaf": [10, 20, 40],
+    }
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    gs = GridSearchCV(
+        HistGradientBoostingClassifier(random_state=42, early_stopping=True,
+                                       n_iter_no_change=10),
+        param_grid, cv=cv, scoring="accuracy", n_jobs=-1, verbose=1,
+    )
+    gs.fit(X, y)
+
+    print(f"\n  Best params: {gs.best_params_}")
+    print(f"  Best CV accuracy: {gs.best_score_:.1%}")
+
+    # Show top 10 results
+    results = pd.DataFrame(gs.cv_results_)
+    results = results.sort_values("rank_test_score")
+    print(f"\n  Top 10 configurations:")
+    print(f"  {'Rank':>4s} {'Accuracy':>9s} {'max_iter':>9s} {'depth':>5s} {'lr':>6s} {'min_leaf':>8s}")
+    print(f"  {'-'*4} {'-'*9} {'-'*9} {'-'*5} {'-'*6} {'-'*8}")
+    for _, row in results.head(10).iterrows():
+        print(f"  {int(row['rank_test_score']):4d} {row['mean_test_score']:9.1%}"
+              f" {int(row['param_max_iter']):9d}"
+              f" {int(row['param_max_depth']):5d}"
+              f" {row['param_learning_rate']:6.2f}"
+              f" {int(row['param_min_samples_leaf']):8d}")
+
+
+def _load_regression_data(sites: Optional[List[str]] = None,
+                          stage1_only: bool = False,
+                          max_rows: Optional[int] = None,
+                          since: Optional[str] = None,
+                          use_forecast: bool = False) -> pd.DataFrame:
+    """Load and prepare feature dataframe for regression backtest."""
+    if sites is None:
+        sites = ALL_SITES
+
+    solar_noon_lookup: Dict[Tuple[str, str], float] = {}
+    if os.path.isfile(SOLAR_NOON_CSV):
+        sn_df = pd.read_csv(SOLAR_NOON_CSV)
+        for _, row in sn_df.iterrows():
+            solar_noon_lookup[(row["site"], str(row["date"]))] = float(row["solar_noon_hour"])
+        print(f"  Loaded {len(solar_noon_lookup)} solar noon entries from cache")
+    else:
+        print(f"  No solar noon cache found — using fallback (12.0)")
+
+    # Build yesterday actual high lookup: {(site, date_str): high_f}
+    yest_high_lookup: Dict[Tuple[str, str], float] = {}
+    if use_forecast:
+        for site in sites:
+            df_tmp = load_site_history(site)
+            if df_tmp.empty:
+                continue
+            for date, day_df in df_tmp.groupby("date"):
+                if "max_temp_6h_f" in day_df.columns:
+                    _m6h = day_df[day_df["max_temp_6h_f"].notna() & (day_df["ts"].dt.hour >= 1)]
+                    if not _m6h.empty:
+                        yest_high_lookup[(site, str(date))] = round(float(
+                            pd.to_numeric(_m6h["max_temp_6h_f"], errors="coerce").max()))
+
+    # Load forecast highs: {(site, date_str): forecast_high_f}
+    forecast_lookup: Dict[Tuple[str, str], float] = {}
+    if use_forecast:
+        fcst_csv = os.path.join(os.path.dirname(SOLAR_NOON_CSV), "forecast_highs.csv")
+        if os.path.isfile(fcst_csv):
+            fcst_df = pd.read_csv(fcst_csv)
+            for _, row in fcst_df.iterrows():
+                forecast_lookup[(row["site"], str(row["date"]))] = float(row["forecast_high_f"])
+            print(f"  Loaded {len(forecast_lookup)} forecast high entries")
+        else:
+            print(f"  WARNING: forecast_highs.csv not found — forecast_vs_naive_f will be NaN")
+
+    rows: List[dict] = []
+    for site in sites:
+        df = load_site_history(site)
+        if df.empty:
+            continue
+        sorted_dates = sorted(df["date"].unique())
+        date_to_prev = {d: sorted_dates[i - 1] if i > 0 else None
+                        for i, d in enumerate(sorted_dates)}
+        for date, day_df in df.groupby("date"):
+            if len(day_df) < 200:
+                continue
+            day_df = day_df.sort_values("ts").reset_index(drop=True)
+            sn = solar_noon_lookup.get((site, str(date)))
+            feats = extract_regression_features(day_df, solar_noon_hour=sn)
+            if feats is None:
+                continue
+            feats["site"] = site
+            feats["date"] = str(date)
+
+            if use_forecast:
+                naive_f = feats.get("naive_f")
+                # Yesterday's actual high relative to today's naive_f
+                prev_date = date_to_prev.get(date)
+                yest_high = yest_high_lookup.get((site, str(prev_date))) if prev_date else None
+                feats["yest_high_vs_naive_f"] = float(yest_high - naive_f) if yest_high is not None and naive_f is not None else np.nan
+                # Forecast high relative to today's naive_f
+                fcst_high = forecast_lookup.get((site, str(date)))
+                feats["forecast_vs_naive_f"] = float(round(fcst_high) - naive_f) if fcst_high is not None and naive_f is not None else np.nan
+
+            rows.append(feats)
+
+    rdf = pd.DataFrame(rows)
+    if since:
+        rdf = rdf[rdf["date"] >= since].reset_index(drop=True)
+        print(f"  Filtered to dates >= {since}: {len(rdf)} rows")
+    n = len(rdf)
+
     sn_na = int((rdf["solar_noon"] == 12.0).sum())
     print(f"  Solar noon: {n - sn_na}/{n} from API, {sn_na} fallback (NA)")
 
-    # Target: offset clamped to {-1, 0, +1}
-    y = rdf["offset"].values.astype(int)
+    feature_cols = list(AUTO_FEATURE_COLS if stage1_only else FEATURE_COLS)
+    # Only require non-NaN for core features; met features can be NaN
+    # (HistGBM handles NaN natively)
+    required_cols = [c for c in feature_cols if c not in _MET_FEATURE_NAMES]
+    feature_mask = rdf[required_cols].notna().all(axis=1)
+    n_dropped = int((~feature_mask).sum())
+    rdf = rdf[feature_mask].reset_index(drop=True)
+    print(f"  Dropped {n_dropped} rows with NA features, {len(rdf)} remaining")
 
-    # Remap to binary for bracket modes
-    if bracket_mode == "upper":
-        y = (y >= 0).astype(int)  # 1 if offset in {0,+1}, 0 if -1
-    elif bracket_mode == "middle":
-        y = (y > 0).astype(int)   # 1 if offset = +1, 0 if offset in {-1,0}
+    if max_rows and len(rdf) > max_rows:
+        rdf = rdf.sample(n=max_rows, random_state=42).reset_index(drop=True)
+        print(f"  Dry-run: sampled {max_rows} rows")
 
+    return rdf
+
+
+def _plot_pr_curves(pr_data: list, stage1_only: bool = False):
+    """Plot precision-recall curves from LOSO test predictions.
+
+    pr_data: list of dicts with keys:
+        site, y_test, s1_proba, s1_classes, [s2_proba, s2_classes]
+    Plots upper (offset>=0) and middle (offset=+1) P/R curves.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import precision_recall_curve, average_precision_score
+
+    def _get_score(proba, classes, mode):
+        """Convert 3-class probabilities to binary score."""
+        cls_list = list(classes)
+        if mode == "upper":
+            # P(offset >= 0) = P(0) + P(+1)
+            idx_0 = cls_list.index(0) if 0 in cls_list else None
+            idx_p1 = cls_list.index(1) if 1 in cls_list else None
+            score = np.zeros(len(proba))
+            if idx_0 is not None:
+                score += proba[:, idx_0]
+            if idx_p1 is not None:
+                score += proba[:, idx_p1]
+            return score
+        elif mode == "middle":
+            # P(offset = +1)
+            idx_p1 = cls_list.index(1) if 1 in cls_list else None
+            if idx_p1 is not None:
+                return proba[:, idx_p1]
+            return np.zeros(len(proba))
+        elif mode == "temp_m1":
+            idx = cls_list.index(-1) if -1 in cls_list else None
+            return proba[:, idx] if idx is not None else np.zeros(len(proba))
+        elif mode == "temp_0":
+            idx = cls_list.index(0) if 0 in cls_list else None
+            return proba[:, idx] if idx is not None else np.zeros(len(proba))
+        elif mode == "temp_p1":
+            idx = cls_list.index(1) if 1 in cls_list else None
+            return proba[:, idx] if idx is not None else np.zeros(len(proba))
+
+    out_dir = project_path("charts")
+    os.makedirs(out_dir, exist_ok=True)
+
+    stages = ["S1"]
+    if not stage1_only:
+        stages.append("S2")
+
+    for mode, mode_label in [("upper", "Upper (offset≥0)"), ("middle", "Middle (offset=+1)"),
+                                ("temp_m1", "Exact: offset=-1"), ("temp_0", "Exact: offset=0"), ("temp_p1", "Exact: offset=+1")]:
+        fig, axes = plt.subplots(1, len(stages), figsize=(7 * len(stages), 6))
+        if len(stages) == 1:
+            axes = [axes]
+
+        for ax, stage in zip(axes, stages):
+            # Per-site curves
+            all_y = []
+            all_scores = []
+
+            for entry in pr_data:
+                y_true = entry["y_test"]
+                if mode == "upper":
+                    y_bin = (y_true >= 0).astype(int)
+                elif mode == "middle":
+                    y_bin = (y_true > 0).astype(int)
+                elif mode == "temp_m1":
+                    y_bin = (y_true == -1).astype(int)
+                elif mode == "temp_0":
+                    y_bin = (y_true == 0).astype(int)
+                elif mode == "temp_p1":
+                    y_bin = (y_true == 1).astype(int)
+
+                proba_key = "s1_proba" if stage == "S1" else "s2_proba"
+                classes_key = "s1_classes" if stage == "S1" else "s2_classes"
+                if proba_key not in entry:
+                    continue
+
+                scores = _get_score(entry[proba_key], entry[classes_key], mode)
+                site = entry["site"]
+
+                all_y.append(y_bin)
+                all_scores.append(scores)
+
+                if len(y_bin) >= 20:
+                    prec, rec, _ = precision_recall_curve(y_bin, scores)
+                    ax.plot(rec, prec, alpha=0.3, linewidth=1, label=f"{site} (n={len(y_bin)})")
+
+            # Combined curve
+            if all_y:
+                y_all = np.concatenate(all_y)
+                s_all = np.concatenate(all_scores)
+                prec, rec, _ = precision_recall_curve(y_all, s_all)
+                ap = average_precision_score(y_all, s_all)
+                ax.plot(rec, prec, color="black", linewidth=2.5,
+                        label=f"Combined (AP={ap:.3f}, n={len(y_all)})")
+
+                # Baseline: prevalence
+                prevalence = y_all.mean()
+                ax.axhline(prevalence, color="gray", linestyle="--", linewidth=1,
+                           label=f"Baseline ({prevalence:.1%})")
+
+            ax.set_xlabel("Recall")
+            ax.set_ylabel("Precision")
+            ax.set_title(f"{stage} — {mode_label}")
+            ax.set_xlim([0, 1])
+            ax.set_ylim([0, 1])
+            ax.legend(fontsize=7, loc="lower left")
+            ax.grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        path = os.path.join(out_dir, f"pr_curve_{mode}.png")
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"  Saved {path}")
+
+
+def backtest_regression(sites: Optional[List[str]] = None,
+                        stage1_only: bool = False,
+                        rdf: Optional[pd.DataFrame] = None):
+    """Train 3-class offset model, eval on exact temp + upper + middle brackets.
+
+    Model always predicts offset {-1, 0, +1}. Evals remap predictions:
+      - Exact: 3-class accuracy
+      - Upper: YES (offset >= 0) vs NO (offset = -1)
+      - Middle: UPPER (offset = +1) vs LOWER (offset <= 0)
+    """
+    from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.model_selection import cross_val_predict
+    from sklearn.metrics import accuracy_score
+
+    if rdf is None:
+        rdf = _load_regression_data(sites, stage1_only)
+
+    n = len(rdf)
+    y_3class = rdf["offset"].values.astype(int)
     site_labels = rdf["site"].values
+    auto_cols = list(AUTO_FEATURE_COLS)
 
-    # --- NA summary per column ------------------------------------------------
-    na_counts = rdf.isna().sum()
-    cols_with_na = na_counts[na_counts > 0]
-    if len(cols_with_na) > 0:
-        print(f"\n  Columns with NA values ({len(cols_with_na)}/{len(rdf.columns)}):")
-        for col, cnt in cols_with_na.sort_values(ascending=False).items():
-            print(f"    {col:40s} {cnt:5d} / {n}  ({cnt/n*100:5.1f}%)")
-    else:
-        print(f"\n  No NA values in any column ({len(rdf.columns)} cols, {n} rows)")
+    def _to_upper(y_raw):
+        return (y_raw >= 0).astype(int)
+
+    def _to_middle(y_raw):
+        return (y_raw > 0).astype(int)
 
     # --- Class distribution --------------------------------------------------
     print("=" * 78)
-    if bracket_mode is None:
-        print("  CLASSIFICATION MODEL: predict offset (actual - naive) in {-1, 0, +1}")
-    elif bracket_mode == "upper":
-        print("  BRACKET-UPPER: predict YES (offset >= 0) vs NO (offset = -1)")
-        print("  Bracket [naive_f, naive_f+1]: will true temp be at or above naive?")
-    elif bracket_mode == "middle":
-        print("  BRACKET-MIDDLE: predict UPPER (offset = +1) vs LOWER (offset <= 0)")
-        print("  Lower [naive_f-1, naive_f] vs Upper [naive_f+1, naive_f+2]")
+    print(f"  3-CLASS OFFSET MODEL → eval on exact / upper / middle")
     print("=" * 78)
     print(f"  Total days: {n}  |  Sites: {len(set(site_labels))}")
-
-    if bracket_mode == "upper":
-        for cls, label in [(1, "YES (offset >= 0)"), (0, "NO  (offset = -1)")]:
-            cnt = int(np.sum(y == cls))
-            print(f"    {label}: {cnt:5d} ({cnt/n*100:5.1f}%)")
-    elif bracket_mode == "middle":
-        for cls, label in [(1, "UPPER (offset = +1)"), (0, "LOWER (offset <= 0)")]:
-            cnt = int(np.sum(y == cls))
-            print(f"    {label}: {cnt:5d} ({cnt/n*100:5.1f}%)")
-    else:
-        for cls in [-1, 0, 1]:
-            cnt = int(np.sum(y == cls))
-            print(f"    offset={cls:+d}: {cnt:5d} ({cnt/n*100:5.1f}%)")
-
-    # --- Feature list (no absolute-temp features) ----------------------------
-    feature_cols = list(FEATURE_COLS)
-
-    # Drop rows where any feature is NA
-    feature_mask = rdf[feature_cols].notna().all(axis=1)
-    n_dropped = int((~feature_mask).sum())
-    rdf = rdf[feature_mask].reset_index(drop=True)
-    y = rdf["offset"].values.astype(int)
-    if bracket_mode == "upper":
-        y = (y >= 0).astype(int)
-    elif bracket_mode == "middle":
-        y = (y > 0).astype(int)
-    site_labels = rdf["site"].values
-    n = len(rdf)
-    print(f"\n  Dropped {n_dropped} rows with NA features, {n} remaining")
-
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    for cls in [-1, 0, 1]:
+        cnt = int(np.sum(y_3class == cls))
+        print(f"    offset={cls:+d}: {cnt:5d} ({cnt/n*100:5.1f}%)")
 
     # --- Baselines -----------------------------------------------------------
+    always_0 = int(np.sum(y_3class == 0))
+    y_upper = _to_upper(y_3class)
+    y_middle = _to_middle(y_3class)
     print(f"\n  Baselines:")
-    if bracket_mode is not None:
-        majority_cls = int(np.argmax(np.bincount(y)))
-        majority_count = int(np.sum(y == majority_cls))
-        always_0_acc = majority_count / n
-        majority_label = {
-            "upper": {1: "always-YES", 0: "always-NO"},
-            "middle": {1: "always-UPPER", 0: "always-LOWER"},
-        }[bracket_mode][majority_cls]
-        print(f"    {majority_label}:  {always_0_acc:.1%} ({majority_count}/{n})")
-    else:
-        always_0_acc = np.sum(y == 0) / n
-        print(f"    Always-0:  {always_0_acc:.1%} ({np.sum(y == 0)}/{n})")
+    print(f"    Exact (always-0):   {always_0/n:.1%}")
+    print(f"    Upper (always-YES): {int(np.sum(y_upper == 1))/n:.1%}")
+    print(f"    Middle (always-0):  {int(np.sum(y_middle == 0))/n:.1%}")
 
-    # =========================================================================
-    # Stage 1: Auto-only model (no METAR features)
-    # =========================================================================
-    auto_cols = [c for c in AUTO_FEATURE_COLS if c in rdf.columns]
     X_auto = rdf[auto_cols].values
 
-    # Always train on 3-class offset for stage 1 (probabilities are richer)
-    y_3class = rdf["offset"].values.astype(int)
+    # --- SHAP feature importances (fit on full data) --------------------------
+    import shap
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-    auto_model = GradientBoostingClassifier(
-        n_estimators=200, max_depth=4, learning_rate=0.1,
-        min_samples_leaf=5, random_state=42)
+    chart_dir = project_path("charts")
+    os.makedirs(chart_dir, exist_ok=True)
 
-    # Out-of-fold predicted probabilities (no data leakage)
-    auto_proba = cross_val_predict(
-        auto_model, X_auto, y_3class, cv=cv, method="predict_proba")
-    auto_pred = cross_val_predict(auto_model, X_auto, y_3class, cv=cv)
-    auto_acc = accuracy_score(y_3class, auto_pred)
-
-    # Map probability columns to class labels
-    auto_model.fit(X_auto, y_3class)
-    auto_classes = auto_model.classes_  # e.g. [-1, 0, 1]
-    prob_col_names = [f"auto_prob_{c:+d}" for c in auto_classes]
-
-    for i, col_name in enumerate(prob_col_names):
-        rdf[col_name] = auto_proba[:, i]
-
-    # Consensus features: stage-1 probability × METAR confirmation
-    rdf["consensus"] = rdf["auto_prob_+1"] * rdf["metar_confirm"]
-    rdf["auto_metar_divergence"] = rdf["auto_prob_+1"] - rdf["metar_confirm"]
-
-    print(f"\n  Stage 1 — Auto-only GBM (no METAR): {auto_acc:.1%} (3-class)")
-
-    # Auto-only feature importances
-    importances = auto_model.feature_importances_
-    sorted_idx = np.argsort(importances)[::-1]
-    print(f"    Top features:")
-    for i in sorted_idx[:8]:
-        print(f"      {auto_cols[i]:30s}: {importances[i]:.4f}")
-
-    # =========================================================================
-    # Stage 2: Combined model (METAR + stacked auto-model probabilities)
-    # =========================================================================
-    metar_cols = [c for c in METAR_FEATURE_COLS if c in rdf.columns]
-    consensus_cols = ["consensus", "auto_metar_divergence"]
-    combined_cols = metar_cols + prob_col_names + consensus_cols
-    feature_cols = combined_cols
-
-    X = rdf[feature_cols].values
-    scaler = StandardScaler()
-    X_s = scaler.fit_transform(X)
-
-    lr_kwargs = {"max_iter": 1000, "random_state": 42}
-    if bracket_mode is None:
-        lr_kwargs["multi_class"] = "multinomial"
-    models = [
-        ("LogisticRegression", LogisticRegression(**lr_kwargs)),
-        ("RandomForest", RandomForestClassifier(
-            n_estimators=200, max_depth=8, min_samples_leaf=5,
-            random_state=42, n_jobs=-1)),
-        ("GradientBoosting", GradientBoostingClassifier(
-            n_estimators=200, max_depth=4, learning_rate=0.1,
-            min_samples_leaf=5, random_state=42)),
-    ]
-
-    print(f"\n  Stage 2 — Combined (auto + METAR + stacked probs):")
-    print(f"  {'Model':<22s} {'Accuracy':>10s}")
-    print(f"  {'-'*22} {'-'*10}")
-
-    # Hard-rule masks for structural overrides
-    metar_above_mask = rdf["metar_above_boundary"].values == 1.0
-    naive_is_high_mask = rdf["naive_is_high"].values == 1.0
-    naive_is_low_mask = (rdf["naive_is_high"].values == 0.0) & (rdf["n_possible_f"].values == 2.0)
-    exact_mask = rdf["n_possible_f"].values == 1.0
-    metar_gap_high_mask = rdf["metar_gap_c"].values >= 0.25
-
-    # Structural override rules: (name, mask, clamped_from, clamped_to, confidence)
-    # Confidence = historical accuracy of the forced value under this condition.
-    # Rules are applied in order; later rules can override earlier ones.
-    if bracket_mode is None:
-        clamp_rules = [
-            # naive_is_low: offset is never -1 (1/679 = 0.1%)
-            ("naive_is_low→0",      naive_is_low_mask,  -1, 0, 0.999),
-            # naive_is_high: offset is rarely +1 (40/740 = 5.4%)
-            ("naive_is_high→0",     naive_is_high_mask,  1, 0, 0.946),
-            # exact (n_possible_f == 1): offset ≈ always 0 (92.8%)
-            ("exact→0",             exact_mask,         -1, 0, 0.928),
-            ("exact→0",             exact_mask,          1, 0, 0.928),
-            # metar_above_boundary: offset is never -1 (0/396)
-            ("metar_above→0",       metar_above_mask,   -1, 0, 1.000),
-            # metar_gap_c >= 0.25: offset is always +1 (188/188 = 100%)
-            ("metar_gap≥.25→+1",    metar_gap_high_mask, 0, 1, 1.000),
-            ("metar_gap≥.25→+1",    metar_gap_high_mask,-1, 1, 1.000),
-        ]
-    elif bracket_mode == "upper":
-        clamp_rules = [
-            # naive_is_low: offset never -1 → always >=0 → 1
-            ("naive_is_low→1",      naive_is_low_mask,   0, 1, 0.999),
-            # exact: offset=0 → >=0 → 1
-            ("exact→1",             exact_mask,          0, 1, 0.928),
-            # metar_above_boundary: offset never -1 → 1
-            ("metar_above→1",       metar_above_mask,    0, 1, 1.000),
-            # metar_gap_c >= 0.25: always +1 → 1
-            ("metar_gap≥.25→1",     metar_gap_high_mask, 0, 1, 1.000),
-        ]
-    else:
-        clamp_rules = []
-
-    best_model_name = None
-    best_acc = always_0_acc
-    best_preds = np.zeros(n, dtype=int)
-    best_confidence = np.full(n, always_0_acc)
-
-    for name, model in models:
-        use_scaled = name == "LogisticRegression"
-        X_in = X_s if use_scaled else X
-        cv_pred = cross_val_predict(model, X_in, y, cv=cv)
-        cv_conf = np.zeros(n, dtype=float)
-
-        # Apply structural overrides in order
-        n_clamped = 0
-        for rule_name, rule_mask, from_val, to_val, conf in clamp_rules:
-            m = rule_mask & (cv_pred == from_val)
-            cnt = int(np.sum(m))
-            n_clamped += cnt
-            cv_pred[m] = to_val
-            cv_conf[m] = conf
-
-        acc = accuracy_score(y, cv_pred)
-        suffix = f"  ({n_clamped} clamped)" if n_clamped else ""
-        print(f"  {name:<22s} {acc:9.1%}{suffix}")
-
-        if acc > best_acc:
-            best_acc = acc
-            best_model_name = name
-            best_preds = cv_pred
-            best_confidence = cv_conf
-
-    baseline_label = "majority-class" if bracket_mode else "always-0"
-    if best_model_name:
-        print(f"\n  Best model: {best_model_name} ({best_acc:.1%} vs {baseline_label} {always_0_acc:.1%})")
-    else:
-        print(f"\n  No model beat {baseline_label} baseline ({always_0_acc:.1%})")
-
-    # --- Clamp confidence breakdown ---------------------------------------------
-    clamped_mask = best_confidence > 0
-    n_clamped_total = int(np.sum(clamped_mask))
-    if n_clamped_total > 0:
-        clamped_correct = int(np.sum((best_preds == y) & clamped_mask))
-        clamped_acc = clamped_correct / n_clamped_total
-        unclamped_mask = ~clamped_mask
-        n_unclamped = int(np.sum(unclamped_mask))
-        unclamped_correct = int(np.sum((best_preds[unclamped_mask] == y[unclamped_mask]))) if n_unclamped else 0
-        unclamped_acc = unclamped_correct / n_unclamped if n_unclamped else 0.0
-        print(f"\n  Clamp breakdown: {n_clamped_total} clamped ({clamped_acc:.1%} acc) "
-              f"| {n_unclamped} unclamped ({unclamped_acc:.1%} acc)")
-        # Per-confidence-level breakdown
-        for conf_val in sorted(set(best_confidence[clamped_mask])):
-            cm = clamped_mask & (best_confidence == conf_val)
-            nc = int(np.sum(cm))
-            correct = int(np.sum((best_preds == y) & cm))
-            print(f"    conf={conf_val:.3f}: {nc:>4d} clamped, {correct}/{nc} correct ({correct/nc:.1%})")
-
-    # --- Per-class metrics for best model ------------------------------------
     print(f"\n{'=' * 78}")
-    print(f"  CLASSIFICATION REPORT (5-fold CV, best: {best_model_name or baseline_label})")
-    print(f"{'=' * 78}")
-    labels = sorted(set(y))
-    if bracket_mode == "upper":
-        target_names = ["NO (offset=-1)", "YES (offset>=0)"]
-    elif bracket_mode == "middle":
-        target_names = ["LOWER (offset<=0)", "UPPER (offset=+1)"]
-    else:
-        target_names = [f"offset={c:+d}" for c in labels]
-    print(classification_report(y, best_preds, labels=labels,
-                                target_names=target_names, zero_division=0))
-
-    # --- Confusion matrix ----------------------------------------------------
-    print(f"  Confusion matrix (rows=true, cols=predicted):")
-    cm = confusion_matrix(y, best_preds, labels=labels)
-    header = "        " + "  ".join(f"{c:+d}" for c in labels)
-    print(f"  {header}")
-    for i, cls in enumerate(labels):
-        row = "  ".join(f"{cm[i, j]:4d}" for j in range(len(labels)))
-        print(f"    {cls:+d}:  {row}")
-
-    # --- Feature importances (fit on full data) ------------------------------
-    print(f"\n{'=' * 78}")
-    print(f"  FEATURE IMPORTANCES")
+    print(f"  SHAP FEATURE IMPORTANCES")
     print(f"{'=' * 78}")
 
-    for name, model in models:
-        use_scaled = name == "LogisticRegression"
-        X_in = X_s if use_scaled else X
-        model.fit(X_in, y)
+    s1_model = HistGradientBoostingClassifier(
+        max_iter=200, max_depth=7, learning_rate=0.05,
+        min_samples_leaf=40, random_state=42)
+    s1_model.fit(X_auto, y_3class)
+    s1_explainer = shap.TreeExplainer(s1_model)
+    s1_shap = s1_explainer(pd.DataFrame(X_auto, columns=auto_cols))
 
-        if hasattr(model, "feature_importances_"):
-            importances = model.feature_importances_
-        elif hasattr(model, "coef_"):
-            # For multiclass LR, average absolute coefficients across classes
-            importances = np.mean(np.abs(model.coef_), axis=0)
-        else:
-            continue
+    # Mean |SHAP| across all classes
+    s1_mean_abs = np.mean(np.mean(np.abs(s1_shap.values), axis=2), axis=0)
+    sorted_idx = np.argsort(s1_mean_abs)[::-1]
+    print(f"\n  Stage 1 (auto-only, mean |SHAP|):")
+    for i in sorted_idx[:15]:
+        print(f"    {auto_cols[i]:30s}: {s1_mean_abs[i]:.4f}")
 
-        sorted_idx = np.argsort(importances)[::-1]
-        print(f"\n  {name}:")
-        for i in sorted_idx[:10]:
-            print(f"    {feature_cols[i]:30s}: {importances[i]:.4f}")
+    # S1 SHAP summary_plot per class
+    colors = {-1: "#F44336", 0: "#FFC107", 1: "#4CAF50"}
+    class_labels = {-1: "minus1", 0: "zero", 1: "plus1"}
+    for ci, cls in enumerate(s1_model.classes_):
+        plt.figure(figsize=(10, 8))
+        shap.summary_plot(s1_shap.values[:, :, ci], pd.DataFrame(X_auto, columns=auto_cols),
+                          max_display=20, show=False, plot_type="dot")
+        plt.title(f"S1 SHAP — offset={cls:+d}")
+        plt.tight_layout()
+        path = os.path.join(chart_dir, f"shap_s1_offset_{class_labels[cls]}.png")
+        plt.savefig(path, dpi=150)
+        plt.close()
+        print(f"  Saved {path}")
 
-    # --- Leave-One-Site-Out CV -----------------------------------------------
+    # S1 bar chart (mean |SHAP| across classes)
+    plt.figure(figsize=(10, 8))
+    shap.summary_plot(np.mean(np.abs(s1_shap.values), axis=2),
+                      pd.DataFrame(X_auto, columns=auto_cols),
+                      max_display=20, show=False, plot_type="bar")
+    plt.title("S1 SHAP — mean |SHAP| (all classes)")
+    plt.tight_layout()
+    path = os.path.join(chart_dir, "shap_s1_bar.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Saved {path}")
+
+    # S1 per-feature dependence plots (top 15 by mean |SHAP|)
+    s1_feat_dir = os.path.join(chart_dir, "shap_s1_features")
+    os.makedirs(s1_feat_dir, exist_ok=True)
+    X_auto_df = pd.DataFrame(X_auto, columns=auto_cols)
+    for rank, fi in enumerate(sorted_idx[:15]):
+        feat_name = auto_cols[fi]
+        for ci, cls in enumerate(s1_model.classes_):
+            plt.figure(figsize=(8, 5))
+            shap.dependence_plot(feat_name, s1_shap.values[:, :, ci],
+                                 X_auto_df, show=False)
+            plt.title(f"S1 SHAP — {feat_name} (offset={cls:+d})")
+            plt.tight_layout()
+            path = os.path.join(s1_feat_dir,
+                                f"{rank:02d}_{feat_name}_{class_labels[cls]}.png")
+            plt.savefig(path, dpi=120)
+            plt.close()
+    print(f"  Saved {len(sorted_idx[:15]) * 3} per-feature plots to {s1_feat_dir}")
+
+    if not stage1_only:
+        # Fit S2 on full data for SHAP
+        s1_classes = s1_model.classes_
+        prob_col_names = [f"auto_prob_{c:+d}" for c in s1_classes]
+        auto_proba_full = s1_model.predict_proba(X_auto)
+        rdf_s2 = rdf.copy()
+        for i, col_name in enumerate(prob_col_names):
+            rdf_s2[col_name] = auto_proba_full[:, i]
+
+        metar_confirm = rdf_s2["metar_confirm"].values
+        auto_prob_p1 = rdf_s2.get("auto_prob_+1", pd.Series(np.zeros(n))).values
+        rdf_s2["consensus"] = auto_prob_p1 * metar_confirm
+        rdf_s2["auto_metar_divergence"] = auto_prob_p1 - metar_confirm
+
+        metar_raw_cols = ["metar_confirm", "metar_gap_c"]
+        consensus_cols = ["consensus", "auto_metar_divergence"]
+        stage2_cols = prob_col_names + metar_raw_cols + consensus_cols
+        X_s2 = rdf_s2[stage2_cols].values
+
+        s2_model = HistGradientBoostingClassifier(
+            max_iter=200, max_depth=5, learning_rate=0.1,
+            min_samples_leaf=5, random_state=42)
+        s2_model.fit(X_s2, y_3class)
+
+        s2_explainer = shap.TreeExplainer(s2_model)
+        s2_shap = s2_explainer(pd.DataFrame(X_s2, columns=stage2_cols))
+
+        s2_mean_abs = np.mean(np.mean(np.abs(s2_shap.values), axis=2), axis=0)
+        sorted_idx = np.argsort(s2_mean_abs)[::-1]
+        print(f"\n  Stage 2 (S1 probs + consensus, mean |SHAP|):")
+        for i in sorted_idx[:len(stage2_cols)]:
+            print(f"    {stage2_cols[i]:30s}: {s2_mean_abs[i]:.4f}")
+
+        for ci, cls in enumerate(s2_model.classes_):
+            plt.figure(figsize=(8, 5))
+            shap.summary_plot(s2_shap.values[:, :, ci], pd.DataFrame(X_s2, columns=stage2_cols),
+                              max_display=10, show=False, plot_type="dot")
+            plt.title(f"S2 SHAP — offset={cls:+d}")
+            plt.tight_layout()
+            path = os.path.join(chart_dir, f"shap_s2_offset_{class_labels[cls]}.png")
+            plt.savefig(path, dpi=150)
+            plt.close()
+            print(f"  Saved {path}")
+
+        plt.figure(figsize=(8, 5))
+        shap.summary_plot(np.mean(np.abs(s2_shap.values), axis=2),
+                          pd.DataFrame(X_s2, columns=stage2_cols),
+                          max_display=10, show=False, plot_type="bar")
+        plt.title("S2 SHAP — mean |SHAP| (all classes)")
+        plt.tight_layout()
+        path = os.path.join(chart_dir, "shap_s2_bar.png")
+        plt.savefig(path, dpi=150)
+        plt.close()
+        print(f"  Saved {path}")
+
+        # S2 per-feature dependence plots
+        s2_feat_dir = os.path.join(chart_dir, "shap_s2_features")
+        os.makedirs(s2_feat_dir, exist_ok=True)
+        X_s2_df = pd.DataFrame(X_s2, columns=stage2_cols)
+        for rank, fi in enumerate(sorted_idx[:len(stage2_cols)]):
+            feat_name = stage2_cols[fi]
+            for ci, cls in enumerate(s2_model.classes_):
+                plt.figure(figsize=(8, 5))
+                shap.dependence_plot(feat_name, s2_shap.values[:, :, ci],
+                                     X_s2_df, show=False)
+                plt.title(f"S2 SHAP — {feat_name} (offset={cls:+d})")
+                plt.tight_layout()
+                path = os.path.join(s2_feat_dir,
+                                    f"{rank:02d}_{feat_name}_{class_labels[cls]}.png")
+                plt.savefig(path, dpi=120)
+                plt.close()
+        print(f"  Saved {len(stage2_cols) * 3} per-feature plots to {s2_feat_dir}")
+
+    # --- Leave-One-Site-Out CV (Kalshi sites only) ----------------------------
+    # Test set: only days from 2026-01-01 onward
+    test_date_cutoff = "2026-01-01"
+    is_test_eligible = rdf["date"].astype(str) >= test_date_cutoff
+    n_test_eligible = int(is_test_eligible.sum())
+
     print(f"\n{'=' * 78}")
-    print(f"  LEAVE-ONE-SITE-OUT CROSS-VALIDATION")
+    loso_label = "LEAVE-ONE-SITE-OUT" + (" (stage1-only)" if stage1_only else " (2-stage)")
+    print(f"  {loso_label}")
+    print(f"  Training sites ({len(TRAINING_SITES)}) always in training set")
+    print(f"  Test set: {n_test_eligible} days from {test_date_cutoff} onward")
     print(f"{'=' * 78}")
 
-    unique_sites = sorted(set(site_labels))
-    base_col = "Majority%" if bracket_mode else "Always0%"
-    print(f"  {'Site':<8s} {'N':>5s} {base_col:>10s}"
-          f" {'Best Acc%':>10s} {'Best':>18s}")
-    print(f"  {'-'*8} {'-'*5} {'-'*10} {'-'*10} {'-'*18}")
+    kalshi_sites_in_data = sorted(s for s in set(site_labels) if s in ALL_SITES)
+    if stage1_only:
+        print(f"  {'Site':<8s} {'N':>5s} {'A0%':>6s} {'Exact':>7s} {'Upper':>7s} {'Middle':>7s}")
+        print(f"  {'-'*8} {'-'*5} {'-'*6} {'-'*7} {'-'*7} {'-'*7}")
+    else:
+        print(f"  {'Site':<8s} {'N':>5s} {'A0%':>6s} {'S1 Ex':>7s} {'S1 Up':>7s} {'S1 Mi':>7s} {'S2 Ex':>7s} {'S2 Up':>7s} {'S2 Mi':>7s}")
+        print(f"  {'-'*8} {'-'*5} {'-'*6} {'-'*7} {'-'*7} {'-'*7} {'-'*7} {'-'*7} {'-'*7}")
 
-    loso_total = 0
-    loso_always0_correct = 0
-    loso_best_correct = 0
+    loso_totals = {"n": 0, "a0": 0, "s1_exact": 0, "s1_upper": 0, "s1_middle": 0,
+                   "s2_exact": 0, "s2_upper": 0, "s2_middle": 0}
 
-    for site in unique_sites:
-        test_mask = site_labels == site
+    # Collect per-site LOSO probabilities for P/R curves
+    pr_data = []  # list of {site, y_test, s1_proba, s2_proba}
+
+    for site in kalshi_sites_in_data:
+        test_mask = (site_labels == site) & is_test_eligible.values
         train_mask = ~test_mask
         n_test = int(test_mask.sum())
         if n_test == 0:
             continue
 
-        y_test = y[test_mask]
-        if bracket_mode is not None:
-            majority_cls_site = int(np.argmax(np.bincount(y)))
-            a0_correct = int(np.sum(y_test == majority_cls_site))
-        else:
-            a0_correct = int(np.sum(y_test == 0))
+        y_test = y_3class[test_mask]
+        y_train = y_3class[train_mask]
+        a0_correct = int(np.sum(y_test == 0))
         a0_acc = a0_correct / n_test
 
-        site_best_name = baseline_label.capitalize()
-        site_best_acc = a0_acc
-        site_best_correct = a0_correct
+        # S1
+        X_auto_train = X_auto[train_mask]
+        X_auto_test = X_auto[test_mask]
 
-        for name, model in models:
-            use_scaled = name == "LogisticRegression"
-            X_train = (X_s if use_scaled else X)[train_mask]
-            X_test = (X_s if use_scaled else X)[test_mask]
-            y_train = y[train_mask]
+        s1 = HistGradientBoostingClassifier(
+            max_iter=200, max_depth=5, learning_rate=0.1,
+            min_samples_leaf=5, random_state=42)
+        s1.fit(X_auto_train, y_train)
+        s1_pred = s1.predict(X_auto_test)
+        s1_proba = s1.predict_proba(X_auto_test)  # (n_test, 3)
 
-            model.fit(X_train, y_train)
-            pred = model.predict(X_test)
+        s1_ex = accuracy_score(y_test, s1_pred)
+        s1_up = accuracy_score(_to_upper(y_test), _to_upper(s1_pred))
+        s1_mi = accuracy_score(_to_middle(y_test), _to_middle(s1_pred))
 
-            acc = accuracy_score(y_test, pred)
-            correct = int(np.sum(pred == y_test))
+        loso_totals["n"] += n_test
+        loso_totals["a0"] += a0_correct
+        loso_totals["s1_exact"] += int(np.sum(s1_pred == y_test))
+        loso_totals["s1_upper"] += int(np.sum(_to_upper(s1_pred) == _to_upper(y_test)))
+        loso_totals["s1_middle"] += int(np.sum(_to_middle(s1_pred) == _to_middle(y_test)))
 
-            if acc > site_best_acc:
-                site_best_acc = acc
-                site_best_correct = correct
-                site_best_name = name
+        site_pr = {"site": site, "y_test": y_test, "s1_proba": s1_proba,
+                   "s1_classes": s1.classes_}
 
-        print(f"  {site:<8s} {n_test:5d} {a0_acc:9.1%}"
-              f" {site_best_acc:9.1%}"
-              f" {site_best_name:>18s}")
+        if stage1_only:
+            pr_data.append(site_pr)
+            print(f"  {site:<8s} {n_test:5d} {a0_acc:5.1%} {s1_ex:6.1%} {s1_up:6.1%} {s1_mi:6.1%}")
+        else:
+            # S2
+            s1_classes_loso = s1.classes_
+            prob_names = [f"auto_prob_{c:+d}" for c in s1_classes_loso]
 
-        loso_total += n_test
-        loso_always0_correct += a0_correct
-        loso_best_correct += site_best_correct
+            train_proba = cross_val_predict(
+                s1, X_auto_train, y_train,
+                cv=min(5, len(set(y_train))),
+                method='predict_proba')
+            s1.fit(X_auto_train, y_train)
 
-    if loso_total > 0:
-        print(f"\n  LOSO totals: {baseline_label} {loso_always0_correct}/{loso_total}"
-              f" ({loso_always0_correct/loso_total*100:.1f}%)"
-              f"  |  best {loso_best_correct}/{loso_total}"
-              f" ({loso_best_correct/loso_total*100:.1f}%)")
+            rdf_train = rdf.loc[train_mask].copy()
+            for i, col_name in enumerate(prob_names):
+                rdf_train[col_name] = train_proba[:, i]
+            mc_train = rdf_train["metar_confirm"].values
+            ap1_train = rdf_train.get("auto_prob_+1", pd.Series(np.zeros(int(train_mask.sum())))).values
+            rdf_train["consensus"] = ap1_train * mc_train
+            rdf_train["auto_metar_divergence"] = ap1_train - mc_train
+
+            test_proba = s1.predict_proba(X_auto_test)
+            rdf_test = rdf.loc[test_mask].copy()
+            for i, col_name in enumerate(prob_names):
+                rdf_test[col_name] = test_proba[:, i]
+            mc_test = rdf_test["metar_confirm"].values
+            ap1_test = rdf_test.get("auto_prob_+1", pd.Series(np.zeros(n_test))).values
+            rdf_test["consensus"] = ap1_test * mc_test
+            rdf_test["auto_metar_divergence"] = ap1_test - mc_test
+
+            s2_cols = prob_names + ["metar_confirm", "metar_gap_c", "consensus", "auto_metar_divergence"]
+            X_s2_train = rdf_train[s2_cols].values
+            X_s2_test = rdf_test[s2_cols].values
+
+            s2 = HistGradientBoostingClassifier(
+                max_iter=200, max_depth=5, learning_rate=0.1,
+                min_samples_leaf=5, random_state=42)
+            s2.fit(X_s2_train, y_train)
+            s2_pred = s2.predict(X_s2_test)
+            s2_proba = s2.predict_proba(X_s2_test)
+
+            s2_ex = accuracy_score(y_test, s2_pred)
+            s2_up = accuracy_score(_to_upper(y_test), _to_upper(s2_pred))
+            s2_mi = accuracy_score(_to_middle(y_test), _to_middle(s2_pred))
+
+            loso_totals["s2_exact"] += int(np.sum(s2_pred == y_test))
+            loso_totals["s2_upper"] += int(np.sum(_to_upper(s2_pred) == _to_upper(y_test)))
+            loso_totals["s2_middle"] += int(np.sum(_to_middle(s2_pred) == _to_middle(y_test)))
+
+            site_pr["s2_proba"] = s2_proba
+            site_pr["s2_classes"] = s2.classes_
+            pr_data.append(site_pr)
+
+            print(f"  {site:<8s} {n_test:5d} {a0_acc:5.1%} {s1_ex:6.1%} {s1_up:6.1%} {s1_mi:6.1%} {s2_ex:6.1%} {s2_up:6.1%} {s2_mi:6.1%}")
+
+    nt = loso_totals["n"]
+    if nt > 0:
+        print(f"\n  LOSO totals (n={nt}):")
+        print(f"    Always-0:  {loso_totals['a0']/nt:.1%}")
+        print(f"    S1 exact:  {loso_totals['s1_exact']/nt:.1%}  upper: {loso_totals['s1_upper']/nt:.1%}  middle: {loso_totals['s1_middle']/nt:.1%}")
+        if not stage1_only:
+            print(f"    S2 exact:  {loso_totals['s2_exact']/nt:.1%}  upper: {loso_totals['s2_upper']/nt:.1%}  middle: {loso_totals['s2_middle']/nt:.1%}")
+
+    # --- Precision-Recall curves (LOSO test set) -----------------------------
+    if pr_data:
+        _plot_pr_curves(pr_data, stage1_only)
 
 
 def backtest_ml_model(sites: Optional[List[str]] = None):
@@ -1854,9 +2202,8 @@ def backtest_ml_model(sites: Optional[List[str]] = None):
     Extracts features from all site-days, trains logistic regression and
     decision tree classifiers with cross-validation, and prints results.
     """
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.tree import DecisionTreeClassifier, export_text
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.experimental import enable_hist_gradient_boosting  # noqa: F401
+    from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.model_selection import cross_val_score, cross_val_predict
 
     if sites is None:
@@ -1928,28 +2275,22 @@ def backtest_ml_model(sites: Optional[List[str]] = None):
     eval_rule("1.1*trans + 1.7*ratio > 0.70 (linear)",
               1.1 * rdf["trans_ratio"] + 1.7 * rdf["dwell_ratio"] > 0.70)
 
-    # --- Logistic regression ------------------------------------------------
+    # --- HistGBM ------------------------------------------------------------
     print(f"\n{'=' * 78}")
-    print(f"  LOGISTIC REGRESSION")
+    print(f"  HIST GRADIENT BOOSTING")
     print(f"{'=' * 78}")
 
     X = rdf[feature_cols].fillna(0).values
-    scaler = StandardScaler()
-    X_s = scaler.fit_transform(X)
 
-    lr = LogisticRegression(max_iter=1000)
-    scores = cross_val_score(lr, X_s, y, cv=5, scoring="accuracy")
+    hgb = HistGradientBoostingClassifier(
+        max_iter=200, max_depth=5, learning_rate=0.1,
+        min_samples_leaf=5, random_state=42,
+    )
+    scores = cross_val_score(hgb, X, y, cv=5, scoring="accuracy")
     print(f"    5-fold CV: {scores.mean():.1%} ± {scores.std():.1%}")
 
-    lr.fit(X_s, y)
-    coefs = sorted(zip(feature_cols, lr.coef_[0]),
-                   key=lambda x: abs(x[1]), reverse=True)
-    print(f"    Coefficients (standardized):")
-    for name, c in coefs:
-        print(f"      {name:20s}: {c:+.3f}")
-
-    # LR with tuned probability threshold
-    proba_cv = cross_val_predict(lr, X_s, y, cv=5, method="predict_proba")[:, 1]
+    # HistGBM with tuned probability threshold
+    proba_cv = cross_val_predict(hgb, X, y, cv=5, method="predict_proba")[:, 1]
     best_t, best_acc = 0.5, 0
     for t100 in range(20, 80):
         t = t100 / 100
@@ -1958,18 +2299,6 @@ def backtest_ml_model(sites: Optional[List[str]] = None):
         if acc > best_acc:
             best_t, best_acc = t, acc
     print(f"    Best probability threshold: {best_t:.2f} → {best_acc:.1%}")
-
-    # --- Decision tree ------------------------------------------------------
-    print(f"\n{'=' * 78}")
-    print(f"  DECISION TREE (depth=3)")
-    print(f"{'=' * 78}")
-
-    dt = DecisionTreeClassifier(max_depth=3)
-    dt_scores = cross_val_score(dt, X, y, cv=5, scoring="accuracy")
-    print(f"    5-fold CV: {dt_scores.mean():.1%} ± {dt_scores.std():.1%}")
-
-    dt.fit(X, y)
-    print(export_text(dt, feature_names=feature_cols))
 
     # --- Leave-one-site-out for best linear rule ----------------------------
     print(f"{'=' * 78}")
@@ -1997,22 +2326,19 @@ def backtest_ml_model(sites: Optional[List[str]] = None):
 def verify_bracket_model(
     sites: Optional[List[str]] = None,
     model_path: Optional[str] = None,
-    bracket_mode: Optional[str] = None,
     stage1_only: bool = False,
+    since: Optional[str] = None,
 ):
-    """Load a trained bracket_model and verify its accuracy on historical data.
+    """Load a trained bracket_model and verify accuracy on historical data.
 
-    For each site-day, extracts features via extract_regression_features(),
-    runs get_probability() with brackets matching the real Kalshi structure,
-    and checks whether the model picks the correct bracket.
+    Evaluates all three metrics in one pass:
+      - Exact: 3-class offset {-1, 0, +1}
+      - Upper: bracket [naive_f, naive_f+1] YES (offset >= 0) vs NO
+      - Middle: upper (offset = +1) vs lower (offset <= 0)
 
-    bracket_mode:
-      None     — 3-class offset {-1, 0, +1} via single-degree brackets
-      "upper"  — binary: bracket [naive_f, naive_f+1] YES vs NO
-      "middle" — binary: upper [naive_f+1, naive_f+2] vs lower [naive_f-1, naive_f]
     stage1_only:
       If True, use stage-1 (auto-only GBM) probabilities instead of
-      the full 2-stage pipeline. Useful for isolating stage-1 performance.
+      the full 2-stage pipeline.
     """
     from weather.bracket_model import load_model, get_probability
 
@@ -2025,8 +2351,8 @@ def verify_bracket_model(
     print(f"  Loaded model: {model.get('trained_at', '?')} "
           f"({model.get('n_rows', '?')} rows, {len(model.get('sites', []))} sites)")
     print(f"  Pipeline: {stage_label}")
-    if bracket_mode:
-        print(f"  Bracket mode: {bracket_mode}")
+    if since:
+        print(f"  Since: {since}")
 
     # Load solar noon cache
     solar_noon_lookup: Dict[Tuple[str, str], float] = {}
@@ -2042,6 +2368,8 @@ def verify_bracket_model(
         if df.empty:
             continue
         for date, day_df in df.groupby("date"):
+            if since and str(date) < since:
+                continue
             if len(day_df) < 200:
                 continue
             day_df = day_df.sort_values("ts").reset_index(drop=True)
@@ -2055,72 +2383,51 @@ def verify_bracket_model(
                 continue
             naive_f = round(float(max_c) * 9.0 / 5.0 + 32.0)
             actual_offset = feats["offset"]
-            actual_f = naive_f + actual_offset
 
-            if bracket_mode == "upper":
-                # Binary: does actual land in [naive_f, naive_f+1]?
-                actual_yes = int(actual_offset >= 0)
-                brackets = [(naive_f, naive_f + 1)]
-                br_results = get_probability(model, feats, brackets)
-                yes_prob = br_results[0][prob_key]
-                pred_yes = int(yes_prob >= 0.5)
-                results.append({
-                    "site": site, "date": str(date),
-                    "actual": actual_yes, "pred": pred_yes,
-                    "correct": pred_yes == actual_yes,
-                    "prob_yes": yes_prob,
-                    "prob_no": 1.0 - yes_prob,
-                    "actual_offset": actual_offset,
-                })
+            # 3-class: single-degree brackets isolating each offset
+            brackets = [
+                (naive_f - 1, naive_f - 1),
+                (naive_f, naive_f),
+                (naive_f + 1, naive_f + 1),
+            ]
+            br_results = get_probability(model, feats, brackets)
+            offset_probs = {}
+            for br in br_results:
+                low, _ = br["bracket"]
+                if low == naive_f - 1:
+                    offset_probs[-1] = br[prob_key]
+                elif low == naive_f:
+                    offset_probs[0] = br[prob_key]
+                elif low == naive_f + 1:
+                    offset_probs[1] = br[prob_key]
 
-            elif bracket_mode == "middle":
-                # Binary: actual in upper [naive_f+1, naive_f+2] vs lower [naive_f-1, naive_f]?
-                actual_upper = int(actual_offset > 0)
-                brackets = [
-                    (naive_f - 1, naive_f),      # lower
-                    (naive_f + 1, naive_f + 2),   # upper
-                ]
-                br_results = get_probability(model, feats, brackets)
-                lower_prob = br_results[0][prob_key]
-                upper_prob = br_results[1][prob_key]
-                pred_upper = int(upper_prob > lower_prob)
-                results.append({
-                    "site": site, "date": str(date),
-                    "actual": actual_upper, "pred": pred_upper,
-                    "correct": pred_upper == actual_upper,
-                    "prob_lower": lower_prob,
-                    "prob_upper": upper_prob,
-                    "actual_offset": actual_offset,
-                })
+            pred_offset = max(offset_probs, key=lambda k: (offset_probs[k], -abs(k)))
 
-            else:
-                # 3-class: single-degree brackets isolating each offset
-                brackets = [
-                    (naive_f - 1, naive_f - 1),
-                    (naive_f, naive_f),
-                    (naive_f + 1, naive_f + 1),
-                ]
-                br_results = get_probability(model, feats, brackets)
-                offset_probs = {}
-                for br in br_results:
-                    low, _ = br["bracket"]
-                    if low == naive_f - 1:
-                        offset_probs[-1] = br[prob_key]
-                    elif low == naive_f:
-                        offset_probs[0] = br[prob_key]
-                    elif low == naive_f + 1:
-                        offset_probs[1] = br[prob_key]
+            # Derive upper/middle from offset probs
+            prob_upper_yes = offset_probs.get(0, 0.0) + offset_probs.get(1, 0.0)
+            actual_upper = int(actual_offset >= 0)
+            pred_upper = int(prob_upper_yes >= 0.5)
 
-                pred_offset = max(offset_probs, key=lambda k: (offset_probs[k], -abs(k)))
-                results.append({
-                    "site": site, "date": str(date),
-                    "actual": actual_offset, "pred": pred_offset,
-                    "correct": pred_offset == actual_offset,
-                    "prob_minus1": offset_probs.get(-1, 0.0),
-                    "prob_0": offset_probs.get(0, 0.0),
-                    "prob_plus1": offset_probs.get(1, 0.0),
-                    "actual_offset": actual_offset,
-                })
+            prob_middle_up = offset_probs.get(1, 0.0)
+            prob_middle_lo = offset_probs.get(-1, 0.0) + offset_probs.get(0, 0.0)
+            actual_middle = int(actual_offset > 0)
+            pred_middle = int(prob_middle_up > prob_middle_lo)
+
+            results.append({
+                "site": site, "date": str(date),
+                "actual_offset": actual_offset,
+                "pred_offset": pred_offset,
+                "exact_correct": pred_offset == actual_offset,
+                "prob_minus1": offset_probs.get(-1, 0.0),
+                "prob_0": offset_probs.get(0, 0.0),
+                "prob_plus1": offset_probs.get(1, 0.0),
+                "actual_upper": actual_upper,
+                "pred_upper": pred_upper,
+                "upper_correct": pred_upper == actual_upper,
+                "actual_middle": actual_middle,
+                "pred_middle": pred_middle,
+                "middle_correct": pred_middle == actual_middle,
+            })
 
     if not results:
         print("  No results generated.")
@@ -2128,149 +2435,85 @@ def verify_bracket_model(
 
     rdf = pd.DataFrame(results)
     n = len(rdf)
-    n_correct = int(rdf["correct"].sum())
 
-    # --- Header ---
+    # === Header ===============================================================
     s1_tag = " (STAGE-1 ONLY)" if stage1_only else ""
-    print(f"\n{'=' * 70}")
-    if bracket_mode == "upper":
-        print(f"  BRACKET MODEL VERIFICATION — UPPER [naive, naive+1] YES/NO{s1_tag}")
-    elif bracket_mode == "middle":
-        print(f"  BRACKET MODEL VERIFICATION — MIDDLE upper vs lower{s1_tag}")
-    else:
-        print(f"  BRACKET MODEL VERIFICATION — 3-CLASS OFFSET{s1_tag}")
-    print(f"{'=' * 70}")
+    print(f"\n{'=' * 78}")
+    print(f"  BRACKET MODEL VERIFICATION{s1_tag}")
+    print(f"{'=' * 78}")
     print(f"  Total days: {n}  |  Sites: {rdf['site'].nunique()}")
+    for cls in [-1, 0, 1]:
+        cnt = int((rdf["actual_offset"] == cls).sum())
+        print(f"    offset={cls:+d}: {cnt:5d} ({cnt / n * 100:5.1f}%)")
 
-    if bracket_mode == "upper":
-        actual_yes = int((rdf["actual"] == 1).sum())
-        baseline = max(actual_yes, n - actual_yes)
-        base_label = "always-YES" if actual_yes >= n - actual_yes else "always-NO"
-        print(f"  Model accuracy: {n_correct}/{n} ({n_correct / n:.1%})")
-        print(f"  {base_label} baseline: {baseline}/{n} ({baseline / n:.1%})")
-        print(f"  Lift: {(n_correct - baseline) / n:+.1%}")
+    # === Summary table ========================================================
+    exact_correct = int(rdf["exact_correct"].sum())
+    upper_correct = int(rdf["upper_correct"].sum())
+    middle_correct = int(rdf["middle_correct"].sum())
+    always_0 = int((rdf["actual_offset"] == 0).sum())
+    always_upper_yes = int((rdf["actual_upper"] == 1).sum())
+    always_middle_lo = int((rdf["actual_middle"] == 0).sum())
 
-        # Class breakdown
-        print(f"\n  {'Class':>8s} {'N':>6s} {'Correct':>8s} {'Acc':>7s} {'Avg prob':>9s}")
-        print(f"  {'-'*8} {'-'*6} {'-'*8} {'-'*7} {'-'*9}")
-        for cls, label in [(1, "YES"), (0, "NO")]:
-            mask = rdf["actual"] == cls
-            cnt = int(mask.sum())
-            if cnt == 0:
-                continue
-            correct = int(rdf.loc[mask, "correct"].sum())
-            avg_p = rdf.loc[mask, "prob_yes" if cls == 1 else "prob_no"].mean()
-            print(f"  {label:>8s} {cnt:>6d} {correct:>8d} {correct / cnt:>7.1%} {avg_p:>9.3f}")
+    print(f"\n  {'Metric':<12s} {'Accuracy':>10s} {'Baseline':>10s} {'Lift':>8s}")
+    print(f"  {'-'*12} {'-'*10} {'-'*10} {'-'*8}")
+    print(f"  {'Exact':<12s} {exact_correct / n:>10.1%} {always_0 / n:>10.1%} "
+          f"{(exact_correct - always_0) / n:>+8.1%}")
+    print(f"  {'Upper':<12s} {upper_correct / n:>10.1%} "
+          f"{max(always_upper_yes, n - always_upper_yes) / n:>10.1%} "
+          f"{(upper_correct - max(always_upper_yes, n - always_upper_yes)) / n:>+8.1%}")
+    print(f"  {'Middle':<12s} {middle_correct / n:>10.1%} "
+          f"{max(always_middle_lo, n - always_middle_lo) / n:>10.1%} "
+          f"{(middle_correct - max(always_middle_lo, n - always_middle_lo)) / n:>+8.1%}")
 
-        # Confusion matrix
-        print(f"\n  Confusion matrix (rows=actual, cols=predicted):")
-        print(f"  {'':>10s}  pred_NO  pred_YES")
-        for actual, label in [(0, "actual_NO"), (1, "actual_YES")]:
-            row = []
-            for pred in [0, 1]:
-                cnt = int(((rdf["actual"] == actual) & (rdf["pred"] == pred)).sum())
-                row.append(f"{cnt:>8d}")
-            print(f"  {label:>10s}  {'  '.join(row)}")
+    # === Per-offset exact accuracy ============================================
+    print(f"\n  Per-offset accuracy:")
+    print(f"  {'Offset':>8s} {'N':>6s} {'Correct':>8s} {'Acc':>7s}")
+    print(f"  {'-'*8} {'-'*6} {'-'*8} {'-'*7}")
+    for offset in [-1, 0, 1]:
+        mask = rdf["actual_offset"] == offset
+        cnt = int(mask.sum())
+        if cnt == 0:
+            continue
+        correct = int(rdf.loc[mask, "exact_correct"].sum())
+        print(f"  {offset:>+8d} {cnt:>6d} {correct:>8d} {correct / cnt:>7.1%}")
 
-    elif bracket_mode == "middle":
-        actual_upper = int((rdf["actual"] == 1).sum())
-        baseline = max(actual_upper, n - actual_upper)
-        base_label = "always-UPPER" if actual_upper >= n - actual_upper else "always-LOWER"
-        print(f"  Model accuracy: {n_correct}/{n} ({n_correct / n:.1%})")
-        print(f"  {base_label} baseline: {baseline}/{n} ({baseline / n:.1%})")
-        print(f"  Lift: {(n_correct - baseline) / n:+.1%}")
+    # === Confusion matrix =====================================================
+    print(f"\n  Confusion matrix (rows=actual, cols=predicted):")
+    print(f"  {'':>8s}  pred-1  pred 0  pred+1")
+    for actual in [-1, 0, 1]:
+        row = []
+        for pred in [-1, 0, 1]:
+            cnt = int(((rdf["actual_offset"] == actual) & (rdf["pred_offset"] == pred)).sum())
+            row.append(f"{cnt:>6d}")
+        print(f"  actual{actual:+d}  {'  '.join(row)}")
 
-        # Class breakdown
-        print(f"\n  {'Class':>8s} {'N':>6s} {'Correct':>8s} {'Acc':>7s} {'Avg prob':>9s}")
-        print(f"  {'-'*8} {'-'*6} {'-'*8} {'-'*7} {'-'*9}")
-        for cls, label, col in [(0, "LOWER", "prob_lower"), (1, "UPPER", "prob_upper")]:
-            mask = rdf["actual"] == cls
-            cnt = int(mask.sum())
-            if cnt == 0:
-                continue
-            correct = int(rdf.loc[mask, "correct"].sum())
-            avg_p = rdf.loc[mask, col].mean()
-            print(f"  {label:>8s} {cnt:>6d} {correct:>8d} {correct / cnt:>7.1%} {avg_p:>9.3f}")
-
-        # Confusion matrix
-        print(f"\n  Confusion matrix (rows=actual, cols=predicted):")
-        print(f"  {'':>12s}  pred_LOW  pred_UP")
-        for actual, label in [(0, "actual_LOW"), (1, "actual_UP")]:
-            row = []
-            for pred in [0, 1]:
-                cnt = int(((rdf["actual"] == actual) & (rdf["pred"] == pred)).sum())
-                row.append(f"{cnt:>8d}")
-            print(f"  {label:>12s}  {'  '.join(row)}")
-
-    else:
-        always_0 = int((rdf["actual_offset"] == 0).sum())
-        print(f"  Model accuracy: {n_correct}/{n} ({n_correct / n:.1%})")
-        print(f"  Always-0 baseline: {always_0}/{n} ({always_0 / n:.1%})")
-        print(f"  Lift: {(n_correct - always_0) / n:+.1%}")
-
-        # Per-offset breakdown
-        print(f"\n  Per-offset accuracy:")
-        print(f"  {'Offset':>8s} {'N':>6s} {'Correct':>8s} {'Acc':>7s}")
-        print(f"  {'-'*8} {'-'*6} {'-'*8} {'-'*7}")
-        for offset in [-1, 0, 1]:
-            mask = rdf["actual_offset"] == offset
-            cnt = int(mask.sum())
-            if cnt == 0:
-                continue
-            correct = int(rdf.loc[mask, "correct"].sum())
-            print(f"  {offset:>+8d} {cnt:>6d} {correct:>8d} {correct / cnt:>7.1%}")
-
-        # Confusion matrix
-        print(f"\n  Confusion matrix (rows=actual, cols=predicted):")
-        print(f"  {'':>8s}  pred-1  pred 0  pred+1")
-        for actual in [-1, 0, 1]:
-            row = []
-            for pred in [-1, 0, 1]:
-                cnt = int(((rdf["actual"] == actual) & (rdf["pred"] == pred)).sum())
-                row.append(f"{cnt:>6d}")
-            print(f"  actual{actual:+d}  {'  '.join(row)}")
-
-    # Per-site accuracy (all modes)
+    # === Per-site accuracy ====================================================
     print(f"\n  Per-site accuracy:")
-    base_col = "Baseline" if bracket_mode else "Always0"
-    print(f"  {'Site':<8s} {'N':>5s} {'Acc':>7s} {base_col:>8s}")
-    print(f"  {'-'*8} {'-'*5} {'-'*7} {'-'*8}")
+    print(f"  {'Site':<8s} {'N':>5s} {'Exact':>7s} {'Upper':>7s} {'Middle':>7s} {'A0%':>6s}")
+    print(f"  {'-'*8} {'-'*5} {'-'*7} {'-'*7} {'-'*7} {'-'*6}")
     for site in sorted(rdf["site"].unique()):
         mask = rdf["site"] == site
         site_df = rdf[mask]
         n_s = len(site_df)
-        correct = int(site_df["correct"].sum())
-        if bracket_mode == "upper":
-            majority = max(int((site_df["actual"] == 1).sum()),
-                           int((site_df["actual"] == 0).sum()))
-        elif bracket_mode == "middle":
-            majority = max(int((site_df["actual"] == 1).sum()),
-                           int((site_df["actual"] == 0).sum()))
-        else:
-            majority = int((site_df["actual_offset"] == 0).sum())
-        print(f"  {site:<8s} {n_s:>5d} {correct / n_s:>7.1%} {majority / n_s:>8.1%}")
+        ex = int(site_df["exact_correct"].sum())
+        up = int(site_df["upper_correct"].sum())
+        mi = int(site_df["middle_correct"].sum())
+        a0 = int((site_df["actual_offset"] == 0).sum())
+        print(f"  {site:<8s} {n_s:>5d} {ex / n_s:>7.1%} {up / n_s:>7.1%} "
+              f"{mi / n_s:>7.1%} {a0 / n_s:>6.1%}")
 
-    # Calibration
-    if bracket_mode is None:
-        mean_correct_prob = 0.0
-        for _, row in rdf.iterrows():
-            ao = row["actual_offset"]
-            if ao == -1:
-                mean_correct_prob += row["prob_minus1"]
-            elif ao == 0:
-                mean_correct_prob += row["prob_0"]
-            else:
-                mean_correct_prob += row["prob_plus1"]
-        mean_correct_prob /= n
-        print(f"\n  Avg predicted prob for correct offset: {mean_correct_prob:.3f}")
-    elif bracket_mode == "upper":
-        avg_p = rdf.apply(
-            lambda r: r["prob_yes"] if r["actual"] == 1 else r["prob_no"], axis=1).mean()
-        print(f"\n  Avg predicted prob for correct class: {avg_p:.3f}")
-    elif bracket_mode == "middle":
-        avg_p = rdf.apply(
-            lambda r: r["prob_upper"] if r["actual"] == 1 else r["prob_lower"], axis=1).mean()
-        print(f"\n  Avg predicted prob for correct class: {avg_p:.3f}")
+    # === Calibration ==========================================================
+    mean_correct_prob = 0.0
+    for _, row in rdf.iterrows():
+        ao = row["actual_offset"]
+        if ao == -1:
+            mean_correct_prob += row["prob_minus1"]
+        elif ao == 0:
+            mean_correct_prob += row["prob_0"]
+        else:
+            mean_correct_prob += row["prob_plus1"]
+    mean_correct_prob /= n
+    print(f"\n  Avg predicted prob for correct offset: {mean_correct_prob:.3f}")
 
 
 def main():
@@ -2291,24 +2534,46 @@ def main():
                         help="Verify latest bracket_model against historical data")
     parser.add_argument("--stage1-only", action="store_true",
                         help="With --verify-model: test stage-1 (auto GBM) only")
+    parser.add_argument("--tune", action="store_true",
+                        help="Grid search HistGBM hyperparameters")
     parser.add_argument("--model-path", type=str, default=None,
                         help="Path to bracket_model pickle (default: latest)")
+    parser.add_argument("--use-all-sites", action="store_true",
+                        help="Include all training sites (default: Kalshi sites only)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Sample 1000 rows for quick iteration")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Only use training data from this date (YYYY-MM-DD)")
+    parser.add_argument("--use-doy", action="store_true",
+                        help="Include day_of_year_sin/cos in feature set")
+    parser.add_argument("--use-forecast", action="store_true",
+                        help="Include forecast features (yesterday high, forecast high vs naive_f)")
     args = parser.parse_args()
 
     sites = args.site.split(",") if args.site else None
-    if args.verify_model:
-        bm = None
-        if args.bracket_upper:
-            bm = "upper"
-        elif args.bracket_middle:
-            bm = "middle"
-        verify_bracket_model(sites, model_path=args.model_path, bracket_mode=bm,
-                             stage1_only=args.stage1_only)
-    elif args.bracket_upper or args.bracket_middle:
-        bracket_mode = "upper" if args.bracket_upper else "middle"
-        backtest_regression(sites, bracket_mode=bracket_mode)
-    elif args.regression:
-        backtest_regression(sites)
+    if sites is None and args.use_all_sites:
+        sites = list(ALL_SITES_WITH_TRAINING)
+    max_rows = 1000 if args.dry_run else None
+    if args.use_doy:
+        for col in DOY_COLS:
+            if col not in FEATURE_COLS:
+                FEATURE_COLS.append(col)
+        AUTO_FEATURE_COLS.extend(c for c in DOY_COLS if c not in AUTO_FEATURE_COLS)
+        print(f"  Including day-of-year sin/cos features")
+    if args.use_forecast:
+        for col in FORECAST_COLS:
+            if col not in FEATURE_COLS:
+                FEATURE_COLS.append(col)
+        AUTO_FEATURE_COLS.extend(c for c in FORECAST_COLS if c not in AUTO_FEATURE_COLS)
+        print(f"  Including forecast features: {FORECAST_COLS}")
+    if args.tune:
+        tune_histgbm(sites, since=args.since)
+    elif args.verify_model:
+        verify_bracket_model(sites, model_path=args.model_path,
+                             stage1_only=args.stage1_only, since=args.since or "2026-01-01")
+    elif args.regression or args.bracket_upper or args.bracket_middle:
+        rdf = _load_regression_data(sites, stage1_only=args.stage1_only, max_rows=max_rows, since=args.since, use_forecast=args.use_forecast)
+        backtest_regression(sites, stage1_only=args.stage1_only, rdf=rdf)
     elif args.ml:
         backtest_ml_model(sites)
     else:

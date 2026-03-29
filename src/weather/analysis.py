@@ -26,7 +26,7 @@ from weather.observations import SYNOPTIC_API_BASE, SYNOPTIC_TOKEN, _synoptic_ob
 
 log = logging.getLogger(__name__)
 
-DATA_DIR = project_path("data")
+DATA_DIR = project_path("data", "weather")
 
 # Combined station coords: Kalshi sites + training-only sites
 _ALL_STATION_COORDS = {**TRAINING_STATIONS, **FORECAST_STATIONS}
@@ -209,12 +209,13 @@ def fetch_historical_obs(
             "STID": site,
             "start": cursor.strftime("%Y%m%d%H%M"),
             "end": chunk_end.strftime("%Y%m%d%H%M"),
-            "vars": "air_temp,air_temp_high_24_hour,air_temp_low_24_hour,"
+            "vars": "air_temp,air_temp_high_6_hour,air_temp_low_6_hour,"
+                    "air_temp_high_24_hour,air_temp_low_24_hour,"
                     "dew_point_temperature,relative_humidity,wind_speed,"
                     "cloud_layer_1_code,sea_level_pressure,pressure_tendency",
             "showemptystations": "1",
-            "units": "temp|F",
             "complete": "1",
+            "units": "metric",
             "token": SYNOPTIC_TOKEN,
             "obtimezone": "local",
         }
@@ -232,7 +233,7 @@ def fetch_historical_obs(
                 stations = data.get("STATION", [])
                 if stations:
                     obs = stations[0].get("OBSERVATIONS", {})
-                    df = _synoptic_obs_to_df(obs, "english")
+                    df = _synoptic_obs_to_df(obs)
                     if not df.empty:
                         frames.append(df)
         except Exception as e:
@@ -272,7 +273,10 @@ def load_or_fetch(
         existing = pd.read_csv(csv_path)
         if not existing.empty and "timestamp" in existing.columns:
             # Force re-fetch if cached CSV lacks required fields
-            if "max_temp_24h_f" not in existing.columns:
+            if "max_temp_6h_f" not in existing.columns:
+                log.info(f"[{site}] Cache missing 6h max fields — forcing re-fetch")
+                existing = pd.DataFrame()
+            elif "max_temp_24h_f" not in existing.columns:
                 log.info(f"[{site}] Cache missing 24h max fields — forcing re-fetch")
                 existing = pd.DataFrame()
             elif "wind_speed_mph" not in existing.columns:
@@ -378,12 +382,13 @@ def extract_daily_highs(obs_df: pd.DataFrame, site: str) -> pd.DataFrame:
         peak_ts = peak_row["ts"]
         peak_hour = peak_ts.hour + peak_ts.minute / 60.0
 
-        # True high: 24h ASOS max (settlement-grade), fallback to obs max
-        true_high = obs_high
-        if has_24h_max:
-            val = grp["max_temp_24h_f"].max()
-            if not np.isnan(val):
-                true_high = float(val)
+        # True high from 6h METARs (skip before 01:00 — previous evening window)
+        if "max_temp_6h_f" not in grp.columns:
+            raise ValueError("max_temp_6h_f column missing — re-fetch history data")
+        _m6h_grp = grp[grp["max_temp_6h_f"].notna() & (grp["ts"].dt.hour >= 1)]
+        if _m6h_grp.empty:
+            continue  # skip day with no daytime 6h METAR
+        true_high = float(pd.to_numeric(_m6h_grp["max_temp_6h_f"], errors="coerce").max())
 
         # True low: 24h ASOS min, fallback to obs min
         true_low = obs_low
@@ -1094,6 +1099,7 @@ def run_analysis(
     days: int = 180,
     fetch_only: bool = False,
     no_fetch: bool = False,
+    force: bool = False,
 ) -> list:
     """Run the full analysis pipeline.
 
@@ -1120,7 +1126,7 @@ def run_analysis(
                 print(f"  No cache found — skipping")
                 obs_cache[site] = pd.DataFrame()
         else:
-            obs_cache[site] = load_or_fetch(site, days=days)
+            obs_cache[site] = load_or_fetch(site, days=days, force=force)
             print(f"  {len(obs_cache[site])} total rows")
 
     if fetch_only:
@@ -1276,6 +1282,10 @@ def main():
         help="Use cached data only, do not fetch",
     )
     parser.add_argument(
+        "--force", action="store_true",
+        help="Force re-fetch all data (ignore cache)",
+    )
+    parser.add_argument(
         "--fetch-forecasts", action="store_true",
         help="Fetch per-day historical forecast highs from Open-Meteo and save to CSV",
     )
@@ -1308,6 +1318,7 @@ def main():
             days=args.days,
             fetch_only=args.fetch_only,
             no_fetch=args.no_fetch,
+            force=args.force,
         )
 
 
